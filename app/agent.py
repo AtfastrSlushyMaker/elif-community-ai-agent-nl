@@ -40,17 +40,59 @@ class CommunitySearchAgent:
 
         plan = await self._plan_actions(query=query, seed_posts=seed_posts, communities=communities, action_budget=action_budget)
         trace.append({"step": "plan", "normalized_query": plan.normalized_query, "actions": [a.model_dump() for a in plan.actions]})
+        community_focus = self._is_community_intent(query=query, intent=plan.intent)
 
         context = {
             "posts": list(seed_posts),
             "communities": communities,
             "flairs": [],
             "comments_by_post": {},
+            "selected_community_ids": set(),
+            "flairs_loaded_for": set(),
         }
+        if community_focus:
+            # For "find communities" intent, avoid polluting synthesis with unrelated seed posts.
+            context["posts"] = []
 
         for action in plan.actions[:action_budget]:
-            result = await self._execute_action(action, context=context, user_id=user_id, community_index=community_index)
+            result = await self._execute_action(
+                action,
+                context=context,
+                user_id=user_id,
+                community_index=community_index,
+                community_focus=community_focus,
+            )
             trace.append({"step": "action", "action": action.model_dump(), "result": result})
+
+        # Auto-load flair context for top selected communities so responses stay community-grounded.
+        selected_community_ids = list(context["selected_community_ids"])[:3]
+        for community_id in selected_community_ids:
+            if community_id in context["flairs_loaded_for"]:
+                continue
+            try:
+                flairs = await self.backend.list_flairs(community_id)
+                names = [str(item.get("name", "")).strip() for item in flairs if item.get("name")]
+                context["flairs"].extend(names)
+                context["flairs_loaded_for"].add(community_id)
+                trace.append({"step": "auto_flairs", "community_id": community_id, "flairs_added": len(names)})
+            except Exception as ex:
+                fallback_names = await self._fallback_flairs_from_posts(community_id=community_id, user_id=user_id)
+                context["flairs"].extend(fallback_names)
+                if fallback_names:
+                    context["flairs_loaded_for"].add(community_id)
+                trace.append(
+                    {
+                        "step": "auto_flairs",
+                        "community_id": community_id,
+                        "error": str(ex),
+                        "fallback_flairs_added": len(fallback_names),
+                    }
+                )
+
+        if community_focus and selected_community_ids:
+            self._filter_posts_by_selected_communities(context["posts"], context["selected_community_ids"])
+
+        await self._ensure_comment_context(context=context, user_id=user_id, trace=trace)
 
         synthesis = await self._synthesize(
             query=query,
@@ -131,6 +173,7 @@ class CommunitySearchAgent:
         context: dict[str, Any],
         user_id: int | None,
         community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
     ) -> dict[str, Any]:
         try:
             if action.type == "search_posts":
@@ -151,11 +194,26 @@ class CommunitySearchAgent:
                     ranked = [
                         c
                         for c in communities
-                        if q in str(c.get("name", "")).lower() or q in str(c.get("description", "")).lower()
+                            if q in str(c.get("name", "")).lower() or q in str(c.get("description", "")).lower()
                     ]
                     context["communities"] = ranked[: max(1, min(limit, 30))]
+                    context["selected_community_ids"] = {
+                        cid
+                        for cid in (self._to_int(c.get("id")) for c in context["communities"])
+                        if cid is not None
+                    }
+                    if community_focus:
+                        self._filter_posts_by_selected_communities(context["posts"], context["selected_community_ids"])
                     return {"ok": True, "communities_selected": len(context["communities"])}
-                return {"ok": True, "communities_selected": len(communities[: max(1, min(limit, 30))])}
+                context["communities"] = communities[: max(1, min(limit, 30))]
+                context["selected_community_ids"] = {
+                    cid
+                    for cid in (self._to_int(c.get("id")) for c in context["communities"])
+                    if cid is not None
+                }
+                if community_focus:
+                    self._filter_posts_by_selected_communities(context["posts"], context["selected_community_ids"])
+                return {"ok": True, "communities_selected": len(context["communities"])}
 
             if action.type == "get_community_flairs":
                 community_id = int(action.args.get("community_id", 0))
@@ -164,6 +222,7 @@ class CommunitySearchAgent:
                 flairs = await self.backend.list_flairs(community_id)
                 names = [str(item.get("name", "")).strip() for item in flairs if item.get("name")]
                 context["flairs"].extend(names)
+                context["flairs_loaded_for"].add(community_id)
                 if community_id in community_index:
                     community_index[community_id]["_flairs"] = names
                 return {"ok": True, "flairs_added": len(names)}
@@ -190,6 +249,7 @@ class CommunitySearchAgent:
             return {"ok": False, "error": str(ex)}
 
     async def _synthesize(self, query: str, normalized_query: str, context: dict[str, Any]) -> dict[str, Any]:
+        user_context = self._collect_user_context(context["posts"], context["comments_by_post"])
         prompt = (
             "You are a community assistant. Use only the provided evidence.\n"
             "Return ONLY JSON with schema:\n"
@@ -204,6 +264,7 @@ class CommunitySearchAgent:
             f"Posts: {json.dumps(self._trim_posts(context['posts']), ensure_ascii=False)}\n"
             f"Communities: {json.dumps(self._trim_communities(context['communities']), ensure_ascii=False)}\n"
             f"Flairs: {json.dumps(sorted({f for f in context['flairs'] if f})[:20], ensure_ascii=False)}\n"
+            f"Users in scope: {json.dumps(user_context, ensure_ascii=False)}\n"
             f"Comments by post: {json.dumps(context['comments_by_post'], ensure_ascii=False)}\n"
         )
 
@@ -336,3 +397,93 @@ class CommunitySearchAgent:
             if isinstance(community_id, int):
                 index[community_id] = community
         return index
+
+    def _is_community_intent(self, query: str, intent: str | None) -> bool:
+        source = f"{query} {intent or ''}".lower()
+        return any(
+            phrase in source
+            for phrase in (
+                "community",
+                "communities",
+                "group",
+                "groups",
+                "where should i join",
+                "which community",
+                "find communities",
+                "show me communities",
+            )
+        )
+
+    def _filter_posts_by_selected_communities(self, posts: list[dict[str, Any]], selected_ids: set[int]) -> None:
+        if not selected_ids:
+            posts.clear()
+            return
+        posts[:] = [post for post in posts if self._to_int(post.get("communityId")) in selected_ids]
+
+    def _to_int(self, value: Any) -> int | None:
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    async def _fallback_flairs_from_posts(self, community_id: int, user_id: int | None) -> list[str]:
+        try:
+            posts = await self.backend.get_community_posts(
+                community_id=community_id,
+                user_id=user_id,
+                sort="HOT",
+                window="ALL",
+                limit=20,
+            )
+        except Exception:
+            return []
+
+        flairs: list[str] = []
+        for post in posts:
+            flair = str(post.get("flairName", "")).strip()
+            if flair:
+                flairs.append(flair)
+        return flairs
+
+    async def _ensure_comment_context(self, context: dict[str, Any], user_id: int | None, trace: list[dict[str, Any]]) -> None:
+        top_posts = sorted(
+            context["posts"],
+            key=lambda post: (int(post.get("voteScore", 0)), int(post.get("commentCount", 0))),
+            reverse=True,
+        )[:5]
+        for post in top_posts:
+            post_id = self._to_int(post.get("id"))
+            if post_id is None:
+                continue
+            key = str(post_id)
+            if key in context["comments_by_post"]:
+                continue
+            try:
+                comments = await self.backend.get_post_comments(post_id, user_id=user_id)
+                context["comments_by_post"][key] = comments[:40]
+                trace.append({"step": "auto_comments", "post_id": post_id, "comments_loaded": len(comments)})
+            except Exception as ex:
+                trace.append({"step": "auto_comments", "post_id": post_id, "error": str(ex)})
+
+    def _collect_user_context(self, posts: list[dict[str, Any]], comments_by_post: dict[str, Any]) -> list[str]:
+        users: set[str] = set()
+        for post in posts:
+            author = str(post.get("authorName", "")).strip()
+            if author:
+                users.add(author)
+        for comment_list in comments_by_post.values():
+            self._collect_comment_authors(comment_list, users)
+        return sorted(users)[:40]
+
+    def _collect_comment_authors(self, comments: Any, users: set[str]) -> None:
+        if not isinstance(comments, list):
+            return
+        for comment in comments:
+            if not isinstance(comment, dict):
+                continue
+            author = str(comment.get("authorName", "")).strip()
+            if author:
+                users.add(author)
+            self._collect_comment_authors(comment.get("replies", []), users)

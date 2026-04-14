@@ -67,3 +67,20 @@ class BackendClient:
         )
         response.raise_for_status()
         return response.json()
+
+    async def get_community_posts(
+        self,
+        community_id: int,
+        user_id: int | None = None,
+        sort: str = "HOT",
+        window: str = "ALL",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        response = await self.client.get(
+            f"{self.base_url}{self.community_prefix}/communities/{community_id}/posts",
+            params={"sort": sort, "window": window},
+            headers=self._headers(user_id=user_id),
+        )
+        response.raise_for_status()
+        posts = response.json()
+        return posts[: max(1, min(limit, 60))]
