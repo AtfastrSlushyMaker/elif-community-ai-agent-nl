@@ -18,6 +18,7 @@ class AgentSearchRequest(BaseModel):
     act_as_user_id: int | None = None
     include_trace: bool = False
     max_actions: int | None = Field(default=None, ge=1, le=12)
+    community_id: int | None = None
 
 
 class AgentAction(BaseModel):

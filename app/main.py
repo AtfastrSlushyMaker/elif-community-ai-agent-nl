@@ -61,6 +61,7 @@ async def agent_search(payload: AgentSearchRequest) -> AgentSearchResponse:
             user_id=payload.user_id,
             act_as_user_id=payload.act_as_user_id,
             max_actions=payload.max_actions,
+            community_id=payload.community_id,
         )
     except Exception as ex:
         raise HTTPException(status_code=502, detail=f"Agent execution failed: {ex}") from ex

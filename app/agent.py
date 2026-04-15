@@ -66,16 +66,34 @@ class CommunitySearchAgent:
         user_id: int | None = None,
         act_as_user_id: int | None = None,
         max_actions: int | None = None,
+        community_id: int | None = None,
     ) -> dict[str, Any]:
         trace: list[dict[str, Any]] = []
         action_budget = max_actions or self.max_actions
-        query_profile = self._build_query_profile(query)
+        is_scoped_search = community_id is not None
+        query_profile = await self._build_query_profile(query)
 
-        seed_posts = await self.backend.search_posts(query, user_id=user_id, limit=12)
-        if query_profile["author_target"]:
-            author_seed = await self.backend.search_posts(str(query_profile["author_target"]), user_id=user_id, limit=12)
-            self._merge_posts(seed_posts, author_seed)
-        communities = await self.backend.list_communities(user_id=user_id)
+        if is_scoped_search:
+            # Scoped search: only search within a specific community
+            trace.append({
+                "step": "scope_info",
+                "community_id": community_id,
+                "scope": "single_community"
+            })
+            seed_posts = await self.backend.search_posts(query, user_id=user_id, limit=20)
+            # Filter posts to only those in the target community
+            seed_posts = [p for p in seed_posts if p.get("community_id") == community_id]
+            communities = await self.backend.list_communities(user_id=user_id)
+            # Filter communities to only the target community
+            communities = [c for c in communities if c.get("id") == community_id]
+        else:
+            # Global search: search across all communities
+            seed_posts = await self.backend.search_posts(query, user_id=user_id, limit=12)
+            if query_profile["author_target"]:
+                author_seed = await self.backend.search_posts(str(query_profile["author_target"]), user_id=user_id, limit=12)
+                self._merge_posts(seed_posts, author_seed)
+            communities = await self.backend.list_communities(user_id=user_id)
+        
         community_index = self._community_index(communities)
         trace.append(
             {
@@ -88,6 +106,13 @@ class CommunitySearchAgent:
 
         plan = await self._plan_actions(query=query, seed_posts=seed_posts, communities=communities, action_budget=action_budget)
         plan = self._augment_plan_for_profile(plan=plan, query=query, query_profile=query_profile, action_budget=action_budget)
+        
+        # For scoped searches, remove unnecessary actions
+        if is_scoped_search:
+            # No need to search/list other communities in scoped search
+            plan.actions = [a for a in plan.actions if a.type not in ["list_communities", "search_flairs", "search_rules"]]
+            trace.append({"step": "plan_optimization", "reason": "scoped_search_context", "actions_before": len(plan.actions) + 3, "actions_after": len(plan.actions)})
+        
         trace.append({"step": "plan", "normalized_query": plan.normalized_query, "actions": [a.model_dump() for a in plan.actions]})
         community_focus = self._is_community_intent(query=query, intent=plan.intent)
 
@@ -95,6 +120,7 @@ class CommunitySearchAgent:
             "posts": list(seed_posts),
             "communities": communities,
             "flairs": [],
+            "rules": [],
             "comments_by_post": {},
             "selected_community_ids": set(),
             "flairs_loaded_for": set(),
@@ -154,14 +180,49 @@ class CommunitySearchAgent:
         )
         trace.append({"step": "synthesis", "model": synthesis.get("model", self.groq_model)})
 
+        # Filter results based on user's result_type intent
+        result_type = query_profile.get("result_type", "all")
+        referenced_posts = self._trim_posts(context["posts"])
+        referenced_communities = self._trim_communities(context["communities"])
+        referenced_flairs = sorted({f.get("name", f) if isinstance(f, dict) else f for f in context["flairs"] if f})[:20]
+        referenced_rules = context["rules"][:10]  # Limit to 10 rules
+        
+        # Prepare results based on result_type
+        if result_type == "posts":
+            # User only wants posts
+            referenced_communities = []
+            referenced_flairs = []
+            referenced_rules = []
+            trace.append({"step": "result_filtering", "reason": "result_type is posts", "cleared": "communities,flairs,rules"})
+        elif result_type == "communities":
+            # User only wants communities
+            referenced_posts = []
+            referenced_flairs = []
+            referenced_rules = []
+            trace.append({"step": "result_filtering", "reason": "result_type is communities", "cleared": "posts,flairs,rules"})
+        elif result_type == "flairs":
+            # User only wants flairs
+            referenced_posts = []
+            referenced_communities = []
+            referenced_rules = []
+            trace.append({"step": "result_filtering", "reason": "result_type is flairs", "cleared": "posts,communities,rules"})
+        elif result_type == "rules":
+            # User only wants rules
+            referenced_posts = []
+            referenced_communities = []
+            referenced_flairs = []
+            trace.append({"step": "result_filtering", "reason": "result_type is rules", "cleared": "posts,communities,flairs"})
+        # else: result_type == "all" - return everything
+
         return {
             "query": query,
             "normalized_query": plan.normalized_query,
             "answer": synthesis["answer"],
             "follow_ups": synthesis["follow_ups"],
-            "referenced_posts": self._trim_posts(context["posts"]),
-            "referenced_communities": self._trim_communities(context["communities"]),
-            "referenced_flairs": sorted({f for f in context["flairs"] if f})[:20],
+            "referenced_posts": referenced_posts,
+            "referenced_communities": referenced_communities,
+            "referenced_flairs": referenced_flairs,
+            "referenced_rules": referenced_rules,
             "model": synthesis.get("model", self.groq_model),
             "trace": trace,
         }
@@ -175,9 +236,17 @@ class CommunitySearchAgent:
             "{"
             '"normalized_query":"...",'
             '"intent":"...",'
-            '"actions":[{"type":"search_posts|list_communities|get_community_flairs|get_post_comments|get_trending_posts","args":{},"reason":"..."}]'
+            '"actions":[{"type":"search_posts|search_flairs|search_rules|list_communities|get_community_flairs|get_post_comments|get_trending_posts","args":{},"reason":"..."}]'
             "}\n"
             f"Max actions: {action_budget}.\n"
+            "Available actions:\n"
+            "- search_posts: Search for posts matching query\n"
+            "- search_flairs: Search for post flairs/tags by name\n"
+            "- search_rules: Search for community rules by content\n"
+            "- list_communities: Filter communities by query\n"
+            "- get_community_flairs: Get all flairs from a specific community\n"
+            "- get_post_comments: Get comments from a specific post\n"
+            "- get_trending_posts: Get trending posts\n"
             "Prefer actions that increase contextual relevance.\n"
             "Do not exceed max actions.\n\n"
             f"User query: {query}\n\n"
@@ -216,6 +285,8 @@ class CommunitySearchAgent:
             actions=[
                 AgentAction(type="search_posts", args={"query": query, "limit": 18}, reason="Collect relevant threads"),
                 AgentAction(type="list_communities", args={"query": query, "limit": 12}, reason="Find best matching communities"),
+                AgentAction(type="search_flairs", args={"query": query}, reason="Find relevant post flairs/tags"),
+                AgentAction(type="search_rules", args={"query": query}, reason="Find relevant community rules"),
                 AgentAction(type="get_trending_posts", args={"sort": "HOT", "window": "WEEK", "limit": 8}, reason="Add current high-signal context"),
             ],
         )
@@ -301,6 +372,24 @@ class CommunitySearchAgent:
                 self._collect_flairs(context["flairs"], posts)
                 self._apply_query_constraints(context=context, query_profile=query_profile, community_index=community_index)
                 return {"ok": True, "trending_added": len(posts)}
+
+            if action.type == "search_flairs":
+                q = str(action.args.get("query", "")).strip()
+                if not q:
+                    return {"ok": False, "error": "missing query"}
+                flairs = await self.backend.search_flairs_by_name(q, context["communities"])
+                if flairs:
+                    context["flairs"].extend([f.get("name") for f in flairs if f.get("name")])
+                return {"ok": True, "flairs_found": len(flairs)}
+
+            if action.type == "search_rules":
+                q = str(action.args.get("query", "")).strip()
+                if not q:
+                    return {"ok": False, "error": "missing query"}
+                rules = await self.backend.search_rules_by_content(q, context["communities"])
+                if rules:
+                    context["rules"].extend(rules)
+                return {"ok": True, "rules_found": len(rules)}
 
             return {"ok": False, "error": f"unsupported action: {action.type}"}
         except Exception as ex:
@@ -561,18 +650,110 @@ class CommunitySearchAgent:
                 users.add(author)
             self._collect_comment_authors(comment.get("replies", []), users)
 
-    def _build_query_profile(self, query: str) -> dict[str, Any]:
+    async def _build_query_profile(self, query: str) -> dict[str, Any]:
         lowered = (query or "").strip().lower()
+        
+        # Try LLM-based interpretation first for better natural language understanding
+        llm_profile = await self._interpret_query_with_llm(query)
+        if llm_profile:
+            return llm_profile
+        
+        # Fallback to regex-based extraction if LLM interpretation fails
         author_target = self._extract_author_target(lowered)
         animals = sorted(self._extract_animals(lowered))
         topic_tokens = [token for token in self._tokenize(lowered) if token not in self.STOP_WORDS]
+        
+        # Infer result_type from keywords
+        result_type = "all"
+        if any(word in lowered for word in ["flairs", "tags", "labels"]):
+            result_type = "flairs"
+        elif any(word in lowered for word in ["rules", "policies", "guidelines"]):
+            result_type = "rules"
+        elif any(word in lowered for word in ["communities", "groups", "communities with", "communities about"]):
+            result_type = "communities"
+        elif any(word in lowered for word in ["posts", "post from", "posts about", "posts by"]):
+            result_type = "posts"
+        
         return {
             "author_target": author_target,
             "strict_author": author_target is not None,
             "animals": animals,
             "strict_animals": bool(animals),
             "topic_tokens": topic_tokens[:8],
+            "result_type": result_type,
         }
+    
+    async def _interpret_query_with_llm(self, query: str) -> dict[str, Any] | None:
+        """Use LLM to interpret user query intent and extract search parameters."""
+        prompt = (
+            "Analyze this community search query and extract key information.\n"
+            "Return ONLY valid JSON with this exact schema:\n"
+            "{"
+            '"author_target": null or "username",'
+            '"animals": [] or ["dog", "cat"] etc.,'
+            '"search_query": "what to actually search for",'
+            '"is_author_query": true/false,'
+            '"is_animal_query": true/false,'
+            '"result_type": "posts" or "communities" or "flairs" or "rules" or "all"'
+            "}\n\n"
+            "Rules:\n"
+            "- author_target: Extract username if user asks for posts FROM or BY someone. Otherwise null.\n"
+            "- animals: Extract pet types mentioned (dog, cat, bird, fish, rabbit, hamster, guinea_pig, parrot).\n"
+            "- search_query: The core search keywords, cleaned of stopwords.\n"
+            "- is_author_query: true if main intent is finding posts from a specific author.\n"
+            "- is_animal_query: true if main intent is about a specific pet type.\n"
+            "- result_type: Determine what user wants based on query keywords:\n"
+            "  * 'posts' if user says: 'posts about', 'show me posts', 'find posts', 'post from'.\n"
+            "  * 'communities' if user says: 'communities about', 'find communities', 'communities with', 'groups about'.\n"
+            "  * 'flairs' if user says: 'flairs', 'tags', 'labels'.\n"
+            "  * 'rules' if user says: 'rules', 'policies', 'guidelines'.\n"
+            "  * 'all' if query is ambiguous or doesn't specify - search across all entities.\n"
+            "- Always use lowercase for author_target and animals.\n\n"
+            f"User query: {query}"
+        )
+        try:
+            raw = await self._groq_json(prompt)
+            parsed = self._parse_json_candidate(raw)
+            if not isinstance(parsed, dict):
+                return None
+            
+            author_target = parsed.get("author_target")
+            if author_target:
+                author_target = str(author_target).strip().lower() or None
+            
+            animals_raw = parsed.get("animals", [])
+            animals = []
+            if isinstance(animals_raw, list):
+                for animal in animals_raw:
+                    animal_str = str(animal).strip().lower()
+                    if animal_str:
+                        animals.append(animal_str)
+            animals = sorted(animals)
+            
+            search_query = str(parsed.get("search_query", "")).strip() or None
+            is_author = bool(parsed.get("is_author_query", False))
+            is_animal = bool(parsed.get("is_animal_query", False))
+            
+            # Extract result_type with validation
+            result_type = str(parsed.get("result_type", "all")).strip().lower()
+            if result_type not in ("posts", "communities", "flairs", "rules", "all"):
+                result_type = "all"
+            
+            # Fallback search query
+            if not search_query:
+                search_query = str(author_target or "").strip() if author_target else None
+            
+            return {
+                "author_target": author_target,
+                "strict_author": is_author and author_target is not None,
+                "animals": animals,
+                "strict_animals": is_animal and bool(animals),
+                "topic_tokens": self._tokenize(search_query or "") if search_query else [],
+                "result_type": result_type,
+                "llm_interpreted": True,
+            }
+        except Exception:
+            return None
 
     def _augment_plan_for_profile(
         self, plan: PlannerResponse, query: str, query_profile: dict[str, Any], action_budget: int

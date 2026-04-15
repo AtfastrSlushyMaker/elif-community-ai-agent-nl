@@ -10,6 +10,8 @@ __pycache__/
 .Python
 build/
 dist/
+site/
+pip-wheel-metadata/
 *.egg-info/
 .eggs/
 
@@ -29,11 +31,23 @@ ENV/
 .coverage
 .coverage.*
 htmlcov/
+.hypothesis/
+
+# Python tooling
+.tox/
+.nox/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
 
 # Type checkers / linters
 .mypy_cache/
 .pyre/
 .ruff_cache/
+
+# Python env/version managers
+.python-version
 
 # Jupyter
 .ipynb_checkpoints/

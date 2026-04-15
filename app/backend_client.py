@@ -84,3 +84,67 @@ class BackendClient:
         response.raise_for_status()
         posts = response.json()
         return posts[: max(1, min(limit, 60))]
+
+    async def get_community_rules(self, community_id: int) -> list[dict[str, Any]]:
+        response = await self.client.get(
+            f"{self.base_url}{self.community_prefix}/communities/{community_id}/rules"
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def search_flairs_by_name(self, query: str, communities: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Search for flairs across communities by name."""
+        results = []
+        query_lower = query.lower()
+        
+        for community in communities[:10]:  # Limit to first 10 communities to avoid too many requests
+            try:
+                community_id = community.get("id")
+                if not community_id:
+                    continue
+                flairs = await self.list_flairs(community_id)
+                for flair in flairs:
+                    flair_name = str(flair.get("name", "")).lower()
+                    if query_lower in flair_name:
+                        results.append({
+                            "type": "flair",
+                            "id": flair.get("id"),
+                            "name": flair.get("name"),
+                            "community_id": community_id,
+                            "community_name": community.get("name"),
+                            "color": flair.get("color"),
+                            "textColor": flair.get("textColor"),
+                        })
+            except Exception:
+                continue
+        
+        return results
+
+    async def search_rules_by_content(self, query: str, communities: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Search for community rules by content."""
+        results = []
+        query_lower = query.lower()
+        
+        for community in communities[:10]:  # Limit to first 10 communities
+            try:
+                community_id = community.get("id")
+                if not community_id:
+                    continue
+                rules = await self.get_community_rules(community_id)
+                for rule in rules:
+                    rule_title = str(rule.get("title", "")).lower()
+                    rule_description = str(rule.get("description", "")).lower()
+                    if query_lower in rule_title or query_lower in rule_description:
+                        results.append({
+                            "type": "rule",
+                            "id": rule.get("id"),
+                            "title": rule.get("title"),
+                            "description": rule.get("description"),
+                            "community_id": community_id,
+                            "community_name": community.get("name"),
+                            "order": rule.get("order"),
+                        })
+            except Exception:
+                continue
+        
+        return results
