@@ -1,11 +1,189 @@
-# Community AI Agent (Groq + FastAPI)
+# Community AI Agent (LLM + FastAPI)
 
 This is a standalone Python microservice that runs natural-language community search as an **agent loop**. It is used by the Elif application at https://github.com/AtfastrSlushyMaker/Elif.
 
 1. Retrieves initial context from Elif community APIs.
-2. Asks Groq to produce an action plan (`search_posts`, `get_post_comments`, `get_community_flairs`, etc.).
+2. Asks an LLM to produce an action plan (`search_posts`, `get_post_comments`, `get_community_flairs`, etc.).
 3. Executes those actions against backend APIs.
-4. Asks Groq for a grounded final answer with follow-up questions.
+4. Asks the LLM for a grounded final answer with follow-up questions.
+
+In this instance, the implementation uses Groq, but the agent pattern is provider-agnostic and can be adapted to your preferred LLM backend.
+
+## How the agent works
+
+The service follows a plan-and-execute loop with guardrails:
+
+1. Build a query profile from the user question (author intent, animal/species intent, topic tokens).
+2. Fetch seed evidence from backend APIs (`search_posts`, `list_communities`).
+3. Ask the configured LLM to return a strict JSON action plan.
+4. Execute actions safely in Python (not directly by the model).
+5. Auto-enrich context with flairs and comments.
+6. Ask the configured LLM for a grounded final answer using only collected evidence.
+
+### Runtime wiring (FastAPI lifespan)
+
+At app startup, one backend client and one agent instance are created and stored in `app.state`:
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    backend = BackendClient(
+        base_url=settings.backend_base_url,
+        community_prefix=settings.backend_community_prefix,
+        timeout_seconds=settings.http_timeout_seconds,
+    )
+    agent = CommunitySearchAgent(
+        backend=backend,
+        groq_api_key=settings.groq_api_key,
+        groq_model=settings.groq_model,
+        max_actions=settings.max_agent_actions,
+    )
+    app.state.backend = backend
+    app.state.agent = agent
+    try:
+        yield
+    finally:
+        await backend.close()
+```
+
+### API entrypoint
+
+The endpoint validates input, runs the agent, and returns a typed response:
+
+```python
+@app.post("/v1/community/agent-search", response_model=AgentSearchResponse)
+async def agent_search(payload: AgentSearchRequest) -> AgentSearchResponse:
+    if not payload.query.strip():
+        raise HTTPException(status_code=400, detail="Query is required")
+
+    result = await app.state.agent.run(
+        query=payload.query,
+        user_id=payload.user_id,
+        act_as_user_id=payload.act_as_user_id,
+        max_actions=payload.max_actions,
+    )
+
+    if not payload.include_trace:
+        result["trace"] = None
+    return AgentSearchResponse(**result)
+```
+
+### Core agent loop
+
+`CommunitySearchAgent.run(...)` orchestrates planning, tool execution, enrichment, and synthesis:
+
+```python
+query_profile = self._build_query_profile(query)
+seed_posts = await self.backend.search_posts(query, user_id=user_id, limit=12)
+communities = await self.backend.list_communities(user_id=user_id)
+
+plan = await self._plan_actions(
+    query=query,
+    seed_posts=seed_posts,
+    communities=communities,
+    action_budget=action_budget,
+)
+
+for action in plan.actions[:action_budget]:
+    await self._execute_action(
+        action,
+        context=context,
+        user_id=user_id,
+        community_index=community_index,
+        community_focus=community_focus,
+        query_profile=query_profile,
+    )
+
+await self._ensure_comment_context(context=context, user_id=user_id, trace=trace)
+synthesis = await self._synthesize(
+    query=query,
+    normalized_query=plan.normalized_query,
+    context=context,
+    query_profile=query_profile,
+)
+```
+
+### Planner contract (JSON only)
+
+The planner asks the configured LLM for strict JSON and only allows known action types:
+
+```json
+{
+  "normalized_query": "cat travel checklist",
+  "intent": "search",
+  "actions": [
+    {
+      "type": "search_posts",
+      "args": { "query": "cat travel checklist", "limit": 18 },
+      "reason": "Collect relevant threads"
+    },
+    {
+      "type": "list_communities",
+      "args": { "query": "cat", "limit": 12 },
+      "reason": "Find relevant communities"
+    },
+    {
+      "type": "get_trending_posts",
+      "args": { "sort": "HOT", "window": "WEEK", "limit": 8 },
+      "reason": "Add high-signal context"
+    }
+  ]
+}
+```
+
+Supported action types:
+
+- `search_posts`
+- `list_communities`
+- `get_community_flairs`
+- `get_post_comments`
+- `get_trending_posts`
+
+If planner output is invalid or empty, the code falls back to a default deterministic plan.
+
+### Example API call
+
+```bash
+curl -X POST http://127.0.0.1:8095/v1/community/agent-search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "best pet transit checklist for EU",
+    "user_id": 12,
+    "include_trace": true,
+    "max_actions": 6
+  }'
+```
+
+### Example response shape
+
+```json
+{
+  "query": "best pet transit checklist for EU",
+  "normalized_query": "pet transit checklist eu",
+  "answer": "...grounded answer...",
+  "follow_ups": [
+    "Show me top posts about pet passports",
+    "Which communities discuss EU relocation most?",
+    "What common mistakes should I avoid?"
+  ],
+  "referenced_posts": [{"id": 123, "title": "..."}],
+  "referenced_communities": [{"id": 9, "name": "..."}],
+  "referenced_flairs": ["Travel", "Paperwork"],
+  "model": "llama-3.3-70b-versatile",
+  "trace": [
+    {"step": "seed_fetch", "posts": 12, "communities": 18},
+    {"step": "plan", "actions": [...]},
+    {"step": "action", "result": {"ok": true}}
+  ]
+}
+```
+
+### Why this is reliable
+
+- The model proposes actions, but Python executes them.
+- Action types are constrained by typed schemas.
+- Parsing is defensive (JSON extraction + fallback plan).
+- Final synthesis is instructed to use only retrieved evidence.
 
 ## What this gives you
 
@@ -40,12 +218,14 @@ Example request:
 
 Copy `.env.example` to `.env` and fill values.
 
-- `GROQ_API_KEY` (required)
+- `GROQ_API_KEY` (required for this Groq-based instance)
 - `GROQ_MODEL` (default: `llama-3.3-70b-versatile`)
 - `BACKEND_BASE_URL` (default: `http://host.docker.internal:8087/elif`)
 - `BACKEND_COMMUNITY_PREFIX` (default: `/api/community`)
 - `HTTP_TIMEOUT_SECONDS` (default: `15`)
 - `MAX_AGENT_ACTIONS` (default: `6`)
+
+To use another provider, replace the LLM client implementation in the agent while keeping the same planner/synthesis JSON contracts.
 
 ## Run locally
 
