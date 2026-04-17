@@ -134,6 +134,18 @@ The planner asks the configured LLM for strict JSON and only allows known action
 Supported action types:
 
 - `search_posts`
+- `search_comments`
+- `get_user_posts`
+- `get_user_comments`
+- `get_post_by_id`
+- `get_related_posts`
+- `get_flair_trends`
+- `compare_communities`
+- `rank_results`
+- `summarize_with_citations`
+- `extract_actionable_advice`
+- `search_flairs`
+- `search_rules`
 - `list_communities`
 - `get_community_flairs`
 - `get_post_comments`
@@ -168,7 +180,13 @@ curl -X POST http://127.0.0.1:8095/v1/community/agent-search \
   ],
   "referenced_posts": [{"id": 123, "title": "..."}],
   "referenced_communities": [{"id": 9, "name": "..."}],
+  "referenced_comments": [{"id": 98, "postId": 123, "authorName": "lina"}],
   "referenced_flairs": ["Travel", "Paperwork"],
+  "referenced_rules": [{"id": 77, "title": "No spam"}],
+  "confidence": 0.82,
+  "gaps": ["Limited recent comments from moderators"],
+  "ranking_factors": [{"factor": "balanced_ranking"}],
+  "next_best_actions": ["compare_communities", "search_comments"],
   "model": "llama-3.3-70b-versatile",
   "trace": [
     {"step": "seed_fetch", "posts": 12, "communities": 18},
@@ -187,7 +205,11 @@ curl -X POST http://127.0.0.1:8095/v1/community/agent-search \
 
 ## What this gives you
 
-- Contextual answers that use posts + comments + communities + flairs.
+- Contextual answers that use posts + comments + communities + flairs + rules.
+- Multi-hop behavior that chains evidence gathering (posts → comments → ranking/comparison → synthesis).
+- Comparison mode with side-by-side community scoring when user intent asks to compare.
+- Recommendation + explainability with `why_selected` on referenced posts and communities.
+- Freshness control (e.g. "last 7 days") applied to evidence selection and ranking.
 - Deterministic tool execution (the LLM proposes actions; Python executes safely).
 - Portable service you can move to a dedicated repo and containerize.
 
@@ -203,6 +225,7 @@ Request fields for `POST /v1/community/agent-search`:
 - `act_as_user_id` (optional)
 - `include_trace` (optional, default `false`)
 - `max_actions` (optional, `1..12`)
+- `community_id` (optional, restricts search to one community)
 
 Example request:
 
@@ -216,11 +239,14 @@ Example request:
 
 ## Environment variables
 
-Copy `.env.example` to `.env` and fill values.
+Use one of the dedicated templates:
+
+- Local runtime: `cp .env.local.example .env`
+- Docker runtime: `cp .env.docker.example .env`
 
 - `GROQ_API_KEY` (required for this Groq-based instance)
 - `GROQ_MODEL` (default: `llama-3.3-70b-versatile`)
-- `BACKEND_BASE_URL` (default: `http://host.docker.internal:8087/elif`)
+- `BACKEND_BASE_URL` (`http://localhost:8087/elif` for local, `http://host.docker.internal:8087/elif` for Docker)
 - `BACKEND_COMMUNITY_PREFIX` (default: `/api/community`)
 - `HTTP_TIMEOUT_SECONDS` (default: `15`)
 - `MAX_AGENT_ACTIONS` (default: `6`)
@@ -231,6 +257,7 @@ To use another provider, replace the LLM client implementation in the agent whil
 
 ```bash
 cd community-ai-agent-nl
+cp .env.local.example .env
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -257,9 +284,29 @@ python3 -m venv .venv
 
 ```bash
 cd community-ai-agent-nl
+cp .env.docker.example .env
 docker build -t community-ai-agent .
 docker run --env-file .env -p 8095:8095 community-ai-agent
 ```
+
+On Linux Docker hosts, add host gateway mapping:
+
+```bash
+docker run --add-host host.docker.internal:host-gateway --env-file .env -p 8095:8095 community-ai-agent
+```
+
+## Backend contract check (agent actions)
+
+The backend endpoints required by agent-executed API calls are available in Elif backend controllers:
+
+- `GET /api/community/posts/search` (`PostController`)
+- `GET /api/community/posts/trending` (`PostController`)
+- `GET /api/community/posts/{id}` (`PostController`)
+- `GET /api/community/posts/{postId}/comments` (`CommentController`)
+- `GET /api/community/communities` (`CommunityController`)
+- `GET /api/community/communities/{id}/posts` (`PostController`)
+- `GET /api/community/communities/{id}/flairs` (`CommunityController`)
+- `GET /api/community/communities/{id}/rules` (`CommunityController`)
 
 ## Development docs
 

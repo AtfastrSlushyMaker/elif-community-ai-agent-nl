@@ -1,204 +1,55 @@
-# Community AI Agent - Architecture & Query Flow
+# Community AI Agent - Architecture & Feature Modes
 
 ## Overview
-The agent now uses **LLM-powered intent understanding** to interpret user queries and filter results accordingly.
 
-## Query Processing Pipeline
+The agent runs a plan-and-execute loop with strict action contracts. The LLM proposes actions; Python executes them against backend APIs and deterministic ranking/comparison logic.
 
-```
-User Query (e.g., "communities about dogs")
-    ↓
-[1] _build_query_profile() - Interpret Intent
-    ├─ Try: _interpret_query_with_llm()
-    │   └─ Groq extracts: author, animals, result_type
-    └─ Fallback: Regex extraction with inference
-    ↓
-[2] Query Profile Created
-    {
-        "author_target": null,
-        "animals": ["dog"],
-        "result_type": "communities",  ← KEY
-        "strict_author": false,
-        "strict_animals": true,
-        "topic_tokens": [...],
-        "llm_interpreted": true
-    }
-    ↓
-[3] Search Execution (via agent loop)
-    ├─ Search posts about dogs
-    ├─ Search communities with dogs
-    ├─ Load comments, flairs, etc.
-    └─ Build context with BOTH posts and communities
-    ↓
-[4] Result Filtering (Final Step)
-    ├─ Read result_type from query profile
-    ├─ If result_type == "communities"
-    │   └─ Clear referenced_posts = []
-    └─ If result_type == "posts"
-        └─ Clear referenced_communities = []
-    ↓
-[5] Return Results
-    {
-        "referenced_posts": [...],
-        "referenced_communities": [...],  ← ONLY these returned
-        "trace": [...]
-    }
-```
+## End-to-end flow
 
-## Key Components
+1. **Interpret query intent**
+   - Extracts author target, animals, result type, freshness window, and behavior modes.
+   - Modes include:
+     - `multi_hop_mode`
+     - `comparison_mode`
+     - `recommendation_mode`
+     - `explainability_mode`
 
-### 1. `_interpret_query_with_llm(query: str)` → dict
-**Purpose:** Use Groq LLM to intelligently interpret user intent
+2. **Seed evidence**
+   - Pulls initial posts and communities.
+   - Applies scoped search (`community_id`) and freshness filtering when requested.
 
-**Input:** Raw user query string
+3. **Plan actions**
+   - LLM returns typed JSON action list.
+   - Agent augments plan based on intent (author, comparison, recommendation, explainability).
 
-**Output:** Structured dict with:
-- `author_target`: Username if user wants posts from someone
-- `animals`: List of pet types mentioned
-- `search_query`: Core keywords cleaned of stopwords
-- `is_author_query`: Boolean flag
-- `is_animal_query`: Boolean flag
-- **`result_type`: "posts" | "communities" | "both"** ← NEW
-- `llm_interpreted`: Boolean
+4. **Execute actions safely**
+   - New action families:
+     - **Discovery**: `search_comments`, `get_user_posts`, `get_user_comments`, `get_post_by_id`, `get_related_posts`
+     - **Analytics**: `get_flair_trends`, `compare_communities`, `rank_results`
+     - **Synthesis support**: `summarize_with_citations`, `extract_actionable_advice`
 
-**Error Handling:** Returns `None` on failure → Fallback to regex
+5. **Synthesize grounded answer**
+   - Returns answer + follow-ups + confidence + gaps.
+   - Includes explainability fields (`why_selected`) and ranking factors.
 
-### 2. `_build_query_profile(query: str)` → dict
-**Purpose:** Build comprehensive query profile for agent
+## Result contract
 
-**Flow:**
-1. Try LLM interpretation first (better NLP)
-2. Fallback to regex + inference (robustness)
-3. Ensure result_type field always present
+The agent now returns:
 
-**Always Returns:**
-- All fields from interpreter
-- `result_type` field (from LLM or inferred)
+- `referenced_posts`
+- `referenced_communities`
+- `referenced_comments`
+- `referenced_flairs`
+- `referenced_rules`
+- `confidence` (`0..1`)
+- `gaps`
+- `ranking_factors`
+- `next_best_actions`
 
-### 3. `run()` → dict (Final Step)
-**Purpose:** Execute search and filter results by intent
+## Behavior details
 
-**Key Addition (lines 157-169):**
-```python
-# Filter results based on user's result_type intent
-result_type = query_profile.get("result_type", "both")
-referenced_posts = self._trim_posts(context["posts"])
-referenced_communities = self._trim_communities(context["communities"])
-
-if result_type == "posts":
-    referenced_communities = []  # Clear communities
-elif result_type == "communities":
-    referenced_posts = []  # Clear posts
-```
-
-## Result Type Logic
-
-### Groq LLM Rules (in prompt)
-The LLM is instructed to classify queries:
-
-```
-"posts" if user says:
-  - "posts about"
-  - "show me posts"
-  - "find posts"
-  - "post from/by"
-
-"communities" if user says:
-  - "communities about"
-  - "find communities"
-  - "communities with"
-  - "groups about"
-
-"both" if:
-  - Query is ambiguous
-  - Doesn't specify type
-  - User wants everything
-```
-
-### Fallback Inference Rules (if LLM fails)
-Keyword-based classification:
-
-```python
-if "communities" in query or "groups" in query:
-    result_type = "communities"
-elif "posts" in query or "post from" in query:
-    result_type = "posts"
-else:
-    result_type = "both"  # Default to both when unsure
-```
-
-## Example Flows
-
-### Example 1: "communities about dogs"
-```
-1. Query Profile: {
-     "result_type": "communities",
-     "animals": ["dog"],
-     "author_target": null
-   }
-
-2. Search Execution:
-   - Searches for communities with "dog"
-   - Also finds posts about dogs (contextually useful)
-   - Loads both into context
-
-3. Result Filtering:
-   - result_type == "communities"
-   - referenced_posts = []  ← Cleared
-   - referenced_communities = [...]  ← Returned
-
-4. User Gets: ONLY communities ✓
-```
-
-### Example 2: "posts from lina"
-```
-1. Query Profile: {
-     "result_type": "posts",
-     "author_target": "lina",
-     "animals": []
-   }
-
-2. Search Execution:
-   - Searches for "lina" posts
-   - Searches general posts
-   - Loads both into context
-
-3. Result Filtering:
-   - result_type == "posts"
-   - referenced_communities = []  ← Cleared
-   - referenced_posts = [...]  ← Returned
-
-4. User Gets: ONLY posts from lina ✓
-```
-
-## Benefits of This Approach
-
-✅ **Natural Language Aware**: LLM understands varied phrasings  
-✅ **Explicit Intent**: User's desired result type is clear  
-✅ **Simple Filtering**: Filter at the end, not throughout pipeline  
-✅ **Robust Fallback**: Regex with smart inference if LLM fails  
-✅ **Transparent**: Trace shows what result_type was selected  
-✅ **No Over-engineering**: Uses existing infrastructure (Groq LLM)  
-✅ **Backward Compatible**: Falls back gracefully if LLM unavailable
-
-## Tracing & Debugging
-
-The agent includes trace entries for transparency:
-
-```python
-trace.append({
-    "step": "result_filtering",
-    "reason": "result_type is communities",
-    "cleared": "posts"
-})
-```
-
-This shows in the response so users/developers can understand why certain results were filtered.
-
-## Future Enhancements
-
-1. **Action Planning Optimization**: Don't search for posts if only communities are wanted
-2. **Confidence Scoring**: Add confidence level to LLM classification
-3. **Query Caching**: Cache profiles for repeated queries
-4. **A/B Testing**: Compare LLM vs regex classification accuracy
-5. **User Feedback Loop**: Learn from corrections
+- **Multi-hop mode**: chains actions to gather and refine evidence before synthesis.
+- **Comparison mode**: builds side-by-side community comparisons from activity and engagement signals.
+- **Recommendation mode**: ranks posts/communities with explicit weighted factors.
+- **Explainability mode**: each referenced post/community can include `why_selected`.
+- **Freshness control**: phrases like `last 7 days`, `past month`, `last week` are converted to date windows and enforced in evidence filtering/ranking.

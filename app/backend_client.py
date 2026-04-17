@@ -68,6 +68,36 @@ class BackendClient:
         response.raise_for_status()
         return response.json()
 
+    async def get_post_by_id(self, post_id: int, user_id: int | None = None) -> dict[str, Any] | None:
+        try:
+            response = await self.client.get(
+                f"{self.base_url}{self.community_prefix}/posts/{post_id}",
+                headers=self._headers(user_id=user_id),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            return payload if isinstance(payload, dict) else None
+        except httpx.HTTPStatusError as ex:
+            if ex.response.status_code != 404:
+                raise
+        posts = await self.search_posts(str(post_id), user_id=user_id, limit=25)
+        for post in posts:
+            try:
+                if int(post.get("id", 0)) == post_id:
+                    return post
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    async def get_user_posts(self, username: str, user_id: int | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        query = (username or "").strip()
+        if not query:
+            return []
+        posts = await self.search_posts(query, user_id=user_id, limit=max(10, min(limit, 60)))
+        lowered = query.lower()
+        filtered = [p for p in posts if lowered in str(p.get("authorName", "")).strip().lower()]
+        return filtered[: max(1, min(limit, 60))]
+
     async def get_community_posts(
         self,
         community_id: int,

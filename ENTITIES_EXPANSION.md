@@ -248,3 +248,36 @@ All entity searches have graceful error handling:
 - If rule search fails → returns empty list
 - If any entity unavailable → continues with available data
 - No single entity failure blocks the entire search
+
+## Advanced Agent Layer (New)
+
+The agent now includes a richer investigation/action layer beyond entity expansion:
+
+### New concrete actions
+
+- `search_comments`
+- `get_user_posts`
+- `get_user_comments`
+- `get_post_by_id`
+- `get_related_posts`
+- `get_flair_trends`
+- `compare_communities`
+- `rank_results`
+- `summarize_with_citations`
+- `extract_actionable_advice`
+
+### New response fields
+
+- `referenced_comments`
+- `confidence` (`0..1`)
+- `gaps`
+- `ranking_factors`
+- `next_best_actions`
+
+### New behavior modes
+
+- **Multi-hop mode**: cascades from discovery to ranking/synthesis.
+- **Comparison mode**: side-by-side community comparison output.
+- **Recommendation mode**: weighted ranking + explicit factor reporting.
+- **Explainability mode**: per-item `why_selected` for posts/communities.
+- **Freshness control**: parses phrases like `last 7 days` and filters evidence accordingly.

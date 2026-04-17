@@ -12,7 +12,7 @@ The scoped search feature allows you to restrict search queries to a single comm
 
 **Global Search (existing behavior):**
 ```bash
-curl -X POST http://localhost:8000/v1/community/agent-search \
+curl -X POST http://localhost:8095/v1/community/agent-search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "posts about dogs",
@@ -22,7 +22,7 @@ curl -X POST http://localhost:8000/v1/community/agent-search \
 
 **Scoped Search (new - search only in community #42):**
 ```bash
-curl -X POST http://localhost:8000/v1/community/agent-search \
+curl -X POST http://localhost:8095/v1/community/agent-search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "posts about dogs",
