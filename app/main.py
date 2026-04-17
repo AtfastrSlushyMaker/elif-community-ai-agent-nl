@@ -22,6 +22,9 @@ async def lifespan(app: FastAPI):
         backend=backend,
         groq_api_key=settings.groq_api_key,
         groq_model=settings.groq_model,
+        ollama_base_url=settings.ollama_base_url,
+        ollama_model=settings.ollama_model,
+        llm_provider=settings.llm_provider,
         max_actions=settings.max_agent_actions,
     )
     app.state.backend = backend

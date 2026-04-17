@@ -48,10 +48,13 @@ class CommunitySearchAgent:
         "please",
     }
 
-    def __init__(self, backend: BackendClient, groq_api_key: str, groq_model: str, max_actions: int) -> None:
+    def __init__(self, backend: BackendClient, groq_api_key: str, groq_model: str, ollama_base_url: str, ollama_model: str, llm_provider: str, max_actions: int) -> None:
         self.backend = backend
         self.groq_api_key = groq_api_key
         self.groq_model = groq_model
+        self.ollama_base_url = ollama_base_url.rstrip('/')
+        self.ollama_model = ollama_model
+        self.llm_provider = llm_provider.lower()
         self.max_actions = max_actions
         self.groq_url = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -507,6 +510,9 @@ class CommunitySearchAgent:
         return {"answer": answer, "follow_ups": follow_ups, "confidence": confidence, "gaps": gaps, "model": self.groq_model}
 
     async def _groq_json(self, prompt: str) -> str:
+        # Try Groq first if selected, fallback to Ollama if fails or if provider is ollama
+        if self.llm_provider == "ollama":
+            return await self._ollama_json(prompt)
         payload = {
             "model": self.groq_model,
             "temperature": 0.2,
@@ -515,11 +521,30 @@ class CommunitySearchAgent:
             "messages": [{"role": "user", "content": prompt}],
         }
         headers = {"Authorization": f"Bearer {self.groq_api_key}", "Content-Type": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(25)) as client:
+                response = await client.post(self.groq_url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                return str(data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+        except Exception as ex:
+            # Fallback to Ollama if Groq fails
+            return await self._ollama_json(prompt)
+
+    async def _ollama_json(self, prompt: str) -> str:
+        payload = {
+            "model": self.ollama_model,
+            "format": "json",
+            "messages": [{"role": "user", "content": prompt}],
+            "options": {"temperature": 0.2, "num_predict": 900}
+        }
         async with httpx.AsyncClient(timeout=httpx.Timeout(25)) as client:
-            response = await client.post(self.groq_url, headers=headers, json=payload)
+            response = await client.post(f"{self.ollama_base_url}/api/chat", json=payload)
             response.raise_for_status()
             data = response.json()
-            return str(data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+            # Ollama returns the result in 'message' or 'response' depending on version
+            content = data.get("message", {}).get("content") or data.get("response")
+            return str(content or "").strip()
 
     def _parse_json_candidate(self, raw: str) -> dict[str, Any] | None:
         source = (raw or "").strip().replace("```json", "").replace("```", "").strip()
