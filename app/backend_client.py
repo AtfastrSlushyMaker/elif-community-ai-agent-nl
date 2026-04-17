@@ -89,13 +89,26 @@ class BackendClient:
                 continue
         return None
 
-    async def get_user_posts(self, username: str, user_id: int | None = None, limit: int = 25) -> list[dict[str, Any]]:
+    async def get_user_posts(self, username: str, user_id: int | None = None, limit: int = 25, month: int | None = None, year: int | None = None) -> list[dict[str, Any]]:
         query = (username or "").strip()
         if not query:
             return []
         posts = await self.search_posts(query, user_id=user_id, limit=max(10, min(limit, 60)))
         lowered = query.lower()
         filtered = [p for p in posts if lowered in str(p.get("authorName", "")).strip().lower()]
+        # Date filter if month/year provided
+        if month and year:
+            from datetime import datetime
+            def in_month_year(post):
+                dt = post.get("createdAt")
+                if not dt:
+                    return False
+                try:
+                    d = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                    return d.month == month and d.year == year
+                except Exception:
+                    return False
+            filtered = [p for p in filtered if in_month_year(p)]
         return filtered[: max(1, min(limit, 60))]
 
     async def get_community_posts(

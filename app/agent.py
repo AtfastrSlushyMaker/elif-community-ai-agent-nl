@@ -73,7 +73,16 @@ class CommunitySearchAgent:
 
         seed_posts = await self.backend.search_posts(query, user_id=user_id, limit=20 if query_profile["recommendation_mode"] else 12)
         if query_profile["author_target"]:
-            author_seed = await self.backend.get_user_posts(str(query_profile["author_target"]), user_id=user_id, limit=16)
+            # Check for month/year in query_profile (simple heuristic for now)
+            month, year = None, None
+            import re
+            m = re.search(r"(january|february|march|april|may|june|july|august|september|october|november|december)\s*(\d{4})?", query.lower())
+            if m:
+                month_str = m.group(1)
+                year = int(m.group(2)) if m.group(2) else datetime.now().year
+                months = ["january","february","march","april","may","june","july","august","september","october","november","december"]
+                month = months.index(month_str) + 1
+            author_seed = await self.backend.get_user_posts(str(query_profile["author_target"]), user_id=user_id, limit=16, month=month, year=year)
             self._merge_posts(seed_posts, author_seed)
         communities = await self.backend.list_communities(user_id=user_id)
 
