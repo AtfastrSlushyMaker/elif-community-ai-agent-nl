@@ -73,16 +73,25 @@ class CommunitySearchAgent:
 
         seed_posts = await self.backend.search_posts(query, user_id=user_id, limit=20 if query_profile["recommendation_mode"] else 12)
         if query_profile["author_target"]:
-            # Check for month/year in query_profile (simple heuristic for now)
-            month, year = None, None
+            # Check for day/month/year in query_profile (improved heuristic)
+            day, month, year = None, None, None
             import re
-            m = re.search(r"(january|february|march|april|may|june|july|august|september|october|november|december)\s*(\d{4})?", query.lower())
+            m = re.search(r"(\d{1,2})?(?:\s*(?:of)?\s*)?(january|february|march|april|may|june|july|august|september|october|november|december)(?:,?\s*(\d{4}))?", query.lower())
             if m:
-                month_str = m.group(1)
-                year = int(m.group(2)) if m.group(2) else datetime.now().year
+                # Accepts '20 of march', 'march 20', 'march 20 2026', etc.
+                if m.group(1) and m.group(2):
+                    day = int(m.group(1))
+                    month_str = m.group(2)
+                elif m.group(2):
+                    month_str = m.group(2)
+                    day = None
+                else:
+                    month_str = None
+                    day = None
+                year = int(m.group(3)) if m.group(3) else datetime.now().year
                 months = ["january","february","march","april","may","june","july","august","september","october","november","december"]
-                month = months.index(month_str) + 1
-            author_seed = await self.backend.get_user_posts(str(query_profile["author_target"]), user_id=user_id, limit=16, month=month, year=year)
+                month = months.index(month_str) + 1 if month_str else None
+            author_seed = await self.backend.get_user_posts(str(query_profile["author_target"]), user_id=user_id, limit=16, day=day, month=month, year=year)
             self._merge_posts(seed_posts, author_seed)
         communities = await self.backend.list_communities(user_id=user_id)
 
