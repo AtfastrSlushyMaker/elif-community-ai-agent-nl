@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 
+
+import os
 from .backend_client import BackendClient
 from .models import AgentAction, PlannerResponse
+from .prompts import build_planner_prompt, build_query_profile_prompt, build_synthesis_prompt
 
 
 class CommunitySearchAgent:
+    MAX_POSTS = 40
+    MAX_COMMUNITIES = 20
+    MAX_COMMENTS = 60
+
     PET_ALIASES: dict[str, set[str]] = {
         "dog": {"dog", "dogs", "puppy", "puppies", "canine"},
         "cat": {"cat", "cats", "kitten", "kittens", "feline"},
@@ -47,16 +57,58 @@ class CommunitySearchAgent:
         "search",
         "please",
     }
+    MONTHS: dict[str, int] = {
+        "january": 1,
+        "february": 2,
+        "march": 3,
+        "april": 4,
+        "may": 5,
+        "june": 6,
+        "july": 7,
+        "august": 8,
+        "september": 9,
+        "october": 10,
+        "november": 11,
+        "december": 12,
+    }
+    QUARTERS: dict[int, tuple[int, int]] = {
+        1: (1, 3),
+        2: (4, 6),
+        3: (7, 9),
+        4: (10, 12),
+    }
 
-    def __init__(self, backend: BackendClient, groq_api_key: str, groq_model: str, ollama_base_url: str, ollama_model: str, llm_provider: str, max_actions: int) -> None:
+    def __init__(
+        self,
+        backend: BackendClient,
+        groq_api_key: str,
+        groq_model: str,
+        max_actions: int,
+    ) -> None:
         self.backend = backend
         self.groq_api_key = groq_api_key
         self.groq_model = groq_model
-        self.ollama_base_url = ollama_base_url.rstrip('/')
-        self.ollama_model = ollama_model
-        self.llm_provider = llm_provider.lower()
         self.max_actions = max_actions
         self.groq_url = "https://api.groq.com/openai/v1/chat/completions"
+        self._action_handlers: dict[str, Callable[..., Awaitable[dict[str, Any]]]] = {
+            "search_posts": self._handle_search_posts,
+            "search_comments": self._handle_search_comments,
+            "get_user_posts": self._handle_get_user_posts,
+            "get_user_comments": self._handle_get_user_comments,
+            "get_post_by_id": self._handle_get_post_by_id,
+            "get_related_posts": self._handle_get_related_posts,
+            "get_flair_trends": self._handle_get_flair_trends,
+            "compare_communities": self._handle_compare_communities,
+            "rank_results": self._handle_rank_results,
+            "summarize_with_citations": self._handle_summarize_with_citations,
+            "extract_actionable_advice": self._handle_extract_actionable_advice,
+            "list_communities": self._handle_list_communities,
+            "get_community_flairs": self._handle_get_community_flairs,
+            "get_post_comments": self._handle_get_post_comments,
+            "get_trending_posts": self._handle_get_trending_posts,
+            "search_flairs": self._handle_search_flairs,
+            "search_rules": self._handle_search_rules,
+        }
 
     async def run(
         self,
@@ -66,39 +118,35 @@ class CommunitySearchAgent:
         max_actions: int | None = None,
         community_id: int | None = None,
     ) -> dict[str, Any]:
+        self.backend.reset_cache()
         trace: list[dict[str, Any]] = []
         action_budget = max_actions or self.max_actions
         is_scoped_search = community_id is not None
-        query_profile = await self._build_query_profile(query)
+        query_profile = await self._build_query_profile(query, trace=trace)
 
-        seed_posts = await self.backend.search_posts(query, user_id=user_id, limit=20 if query_profile["recommendation_mode"] else 12)
+        seed_posts = await self.backend.search_posts(
+            query,
+            user_id=user_id,
+            limit=20 if query_profile["recommendation_mode"] else 12,
+        )
         if query_profile["author_target"]:
-            # Check for day/month/year in query_profile (improved heuristic)
-            day, month, year = None, None, None
-            import re
-            m = re.search(r"(\d{1,2})?(?:\s*(?:of)?\s*)?(january|february|march|april|may|june|july|august|september|october|november|december)(?:,?\s*(\d{4}))?", query.lower())
-            if m:
-                # Accepts '20 of march', 'march 20', 'march 20 2026', etc.
-                if m.group(1) and m.group(2):
-                    day = int(m.group(1))
-                    month_str = m.group(2)
-                elif m.group(2):
-                    month_str = m.group(2)
-                    day = None
-                else:
-                    month_str = None
-                    day = None
-                year = int(m.group(3)) if m.group(3) else datetime.now().year
-                months = ["january","february","march","april","may","june","july","august","september","october","november","december"]
-                month = months.index(month_str) + 1 if month_str else None
-            author_seed = await self.backend.get_user_posts(str(query_profile["author_target"]), user_id=user_id, limit=16, day=day, month=month, year=year)
-            self._merge_posts(seed_posts, author_seed)
+            date_filter = query_profile.get("date_filter")
+            author_seed = await self.backend.get_user_posts(
+                str(query_profile["author_target"]),
+                user_id=user_id,
+                limit=16,
+                day=self._to_int((date_filter or {}).get("day")),
+                month=self._to_int((date_filter or {}).get("month")),
+                year=self._to_int((date_filter or {}).get("year")),
+            )
+            self._merge_posts(seed_posts, self._filter_posts_by_date_filter(author_seed, date_filter))
+
         communities = await self.backend.list_communities(user_id=user_id)
 
         if is_scoped_search:
             trace.append({"step": "scope_info", "community_id": community_id, "scope": "single_community"})
-            seed_posts = [p for p in seed_posts if self._post_community_id(p) == community_id]
-            communities = [c for c in communities if self._to_int(c.get("id")) == community_id]
+            seed_posts = [post for post in seed_posts if self._post_community_id(post) == community_id]
+            communities = [community for community in communities if self._to_int(community.get("id")) == community_id]
 
         seed_posts = self._filter_posts_by_freshness(seed_posts, query_profile["freshness_days"])
         community_index = self._community_index(communities)
@@ -112,12 +160,18 @@ class CommunitySearchAgent:
             }
         )
 
-        plan = await self._plan_actions(query=query, seed_posts=seed_posts, communities=communities, action_budget=action_budget)
+        plan = await self._plan_actions(
+            query=query,
+            seed_posts=seed_posts,
+            communities=communities,
+            action_budget=action_budget,
+            trace=trace,
+        )
         plan = self._augment_plan_for_profile(plan=plan, query=query, query_profile=query_profile, action_budget=action_budget)
         plan = self._apply_mode_enhancements(plan=plan, query=query, query_profile=query_profile, action_budget=action_budget)
 
         if is_scoped_search:
-            filtered_actions = [a for a in plan.actions if a.type != "compare_communities"]
+            filtered_actions = [action for action in plan.actions if action.type != "compare_communities"]
             trace.append(
                 {
                     "step": "plan_optimization",
@@ -128,7 +182,7 @@ class CommunitySearchAgent:
             )
             plan.actions = filtered_actions
 
-        trace.append({"step": "plan", "normalized_query": plan.normalized_query, "actions": [a.model_dump() for a in plan.actions]})
+        trace.append({"step": "plan", "normalized_query": plan.normalized_query, "actions": [action.model_dump() for action in plan.actions]})
         community_focus = self._is_community_intent(query=query, intent=plan.intent)
 
         context: dict[str, Any] = {
@@ -150,20 +204,41 @@ class CommunitySearchAgent:
             "why_community": {},
         }
 
-        self._apply_query_constraints(context=context, query_profile=query_profile, community_index=community_index)
         if community_focus:
             context["posts"] = []
 
         for action in plan.actions[:action_budget]:
-            result = await self._execute_action(
-                action=action,
-                context=context,
-                user_id=user_id,
-                community_index=community_index,
-                community_focus=community_focus,
-                query_profile=query_profile,
+            started = time.monotonic()
+            try:
+                result = await self._execute_action(
+                    action=action,
+                    context=context,
+                    user_id=user_id,
+                    community_index=community_index,
+                    community_focus=community_focus,
+                    query_profile=query_profile,
+                )
+            except Exception as ex:
+                trace.append(
+                    {
+                        "step": "action",
+                        "action": action.model_dump(),
+                        "result": {"ok": False, "error": str(ex)},
+                        "error_type": type(ex).__name__,
+                        "duration_ms": round((time.monotonic() - started) * 1000),
+                    }
+                )
+                raise
+
+            trace.append(
+                {
+                    "step": "action",
+                    "action": action.model_dump(),
+                    "result": result,
+                    "error_type": result.get("error_type"),
+                    "duration_ms": round((time.monotonic() - started) * 1000),
+                }
             )
-            trace.append({"step": "action", "action": action.model_dump(), "result": result})
 
         await self._auto_load_flairs(context=context, user_id=user_id, trace=trace)
         self._apply_query_constraints(context=context, query_profile=query_profile, community_index=community_index)
@@ -179,6 +254,7 @@ class CommunitySearchAgent:
             normalized_query=plan.normalized_query,
             context=context,
             query_profile=query_profile,
+            trace=trace,
         )
         trace.append({"step": "synthesis", "model": synthesis.get("model", self.groq_model)})
 
@@ -231,25 +307,18 @@ class CommunitySearchAgent:
         }
 
     async def _plan_actions(
-        self, query: str, seed_posts: list[dict[str, Any]], communities: list[dict[str, Any]], action_budget: int
+        self,
+        query: str,
+        seed_posts: list[dict[str, Any]],
+        communities: list[dict[str, Any]],
+        action_budget: int,
+        trace: list[dict[str, Any]],
     ) -> PlannerResponse:
-        prompt = (
-            "You are an execution planner for community search.\n"
-            "Return ONLY JSON with schema:\n"
-            "{"
-            '"normalized_query":"...",'
-            '"intent":"...",'
-            '"actions":[{"type":"search_posts|search_comments|get_user_posts|get_user_comments|get_post_by_id|get_related_posts|get_flair_trends|compare_communities|rank_results|summarize_with_citations|extract_actionable_advice|search_flairs|search_rules|list_communities|get_community_flairs|get_post_comments|get_trending_posts","args":{},"reason":"..."}]'
-            "}\n"
-            f"Max actions: {action_budget}.\n"
-            "Prioritize multi-hop actions when user asks for analysis/comparison/recommendation/explanation.\n"
-            "Do not exceed max actions.\n\n"
-            f"User query: {query}\n\n"
-            f"Seed posts sample: {json.dumps(seed_posts[:5], ensure_ascii=False)}\n"
-            f"Communities sample: {json.dumps(communities[:8], ensure_ascii=False)}"
-        )
-        raw = await self._groq_json(prompt)
+        prompt = build_planner_prompt(query=query, seed_posts=seed_posts, communities=communities, action_budget=action_budget)
+        raw = await self._groq_json(prompt, caller="_plan_actions", trace=trace)
         parsed = self._parse_json_candidate(raw)
+        if parsed is None:
+            trace.append({"step": "llm_parse_failure", "caller": "_plan_actions", "raw_preview": raw[:300]})
         if not isinstance(parsed, dict):
             return self._default_plan(query)
 
@@ -281,7 +350,7 @@ class CommunitySearchAgent:
                 AgentAction(type="search_posts", args={"query": query, "limit": 18}, reason="Collect relevant threads"),
                 AgentAction(type="list_communities", args={"query": query, "limit": 14}, reason="Find best matching communities"),
                 AgentAction(type="search_comments", args={"query": query, "limit_posts": 8, "limit_comments_per_post": 24}, reason="Find direct discussion evidence"),
-                AgentAction(type="search_flairs", args={"query": query}, reason="Find relevant post flairs/tags"),
+                AgentAction(type="search_flairs", args={"query": query}, reason="Find relevant post flairs or tags"),
                 AgentAction(type="rank_results", args={"strategy": "balanced"}, reason="Rank output with explicit factors"),
                 AgentAction(type="extract_actionable_advice", args={}, reason="Derive practical next steps"),
             ],
@@ -296,182 +365,347 @@ class CommunitySearchAgent:
         community_focus: bool,
         query_profile: dict[str, Any],
     ) -> dict[str, Any]:
+        handler = self._action_handlers.get(action.type)
+        if handler is None:
+            return {"ok": False, "error": f"unsupported action: {action.type}", "error_type": "unsupported_action"}
+
         try:
-            if action.type == "search_posts":
-                q = str(action.args.get("query", "")).strip()
-                if not q:
-                    return {"ok": False, "error": "missing query"}
-                limit = int(action.args.get("limit", 16))
-                posts = await self.backend.search_posts(q, user_id=user_id, limit=limit)
-                posts = self._filter_posts_by_freshness(posts, query_profile["freshness_days"])
-                self._merge_posts(context["posts"], posts)
-                self._collect_flairs(context["flairs"], posts)
-                self._apply_query_constraints(context=context, query_profile=query_profile, community_index=community_index)
-                return {"ok": True, "posts_added": len(posts)}
-
-            if action.type == "search_comments":
-                q = str(action.args.get("query", "")).strip()
-                if not q:
-                    return {"ok": False, "error": "missing query"}
-                limit_posts = int(action.args.get("limit_posts", 6))
-                limit_comments = int(action.args.get("limit_comments_per_post", 20))
-                comments = await self._search_comments(query=q, posts=context["posts"][: max(1, min(limit_posts, 12))], user_id=user_id, limit_per_post=limit_comments)
-                self._merge_comments(context["matched_comments"], comments)
-                return {"ok": True, "comments_found": len(comments)}
-
-            if action.type == "get_user_posts":
-                username = str(action.args.get("username", query_profile.get("author_target", ""))).strip()
-                if not username:
-                    return {"ok": False, "error": "missing username"}
-                limit = int(action.args.get("limit", 20))
-                posts = await self.backend.get_user_posts(username, user_id=user_id, limit=limit)
-                posts = self._filter_posts_by_freshness(posts, query_profile["freshness_days"])
-                self._merge_posts(context["posts"], posts)
-                self._collect_flairs(context["flairs"], posts)
-                return {"ok": True, "posts_added": len(posts), "username": username}
-
-            if action.type == "get_user_comments":
-                username = str(action.args.get("username", query_profile.get("author_target", ""))).strip().lower()
-                if not username:
-                    return {"ok": False, "error": "missing username"}
-                await self._ensure_comment_context(context=context, user_id=user_id, trace=[])
-                user_comments = []
-                for post in context["posts"][:12]:
-                    post_id = self._to_int(post.get("id"))
-                    if post_id is None:
-                        continue
-                    for comment in self._flatten_comments(context["comments_by_post"].get(str(post_id), []), post_id=post_id):
-                        if username in str(comment.get("authorName", "")).strip().lower():
-                            user_comments.append(comment)
-                self._merge_comments(context["matched_comments"], user_comments)
-                return {"ok": True, "comments_found": len(user_comments), "username": username}
-
-            if action.type == "get_post_by_id":
-                post_id = int(action.args.get("post_id", 0))
-                if post_id <= 0:
-                    return {"ok": False, "error": "missing post_id"}
-                post = await self.backend.get_post_by_id(post_id, user_id=user_id)
-                if not post:
-                    return {"ok": True, "post_found": False}
-                self._merge_posts(context["posts"], [post])
-                self._collect_flairs(context["flairs"], [post])
-                return {"ok": True, "post_found": True}
-
-            if action.type == "get_related_posts":
-                post_id = int(action.args.get("post_id", 0))
-                if post_id <= 0:
-                    return {"ok": False, "error": "missing post_id"}
-                related = await self._get_related_posts(post_id=post_id, context=context, user_id=user_id, limit=int(action.args.get("limit", 8)))
-                self._merge_posts(context["posts"], related)
-                self._collect_flairs(context["flairs"], related)
-                return {"ok": True, "related_added": len(related)}
-
-            if action.type == "get_flair_trends":
-                trends = self._build_flair_trends(context["posts"])
-                for trend in trends:
-                    context["flairs"].append(trend["name"])
-                context["ranking_factors"].append({"factor": "flair_trends", "top": trends[:5]})
-                return {"ok": True, "trends_found": len(trends)}
-
-            if action.type == "compare_communities":
-                comparison = self._compare_communities(context=context, query_profile=query_profile)
-                if comparison:
-                    context["community_comparisons"].append(comparison)
-                    context["analysis_notes"].append(f"Comparison: {comparison.get('summary', '')}".strip())
-                    return {"ok": True, "compared": len(comparison.get("items", []))}
-                return {"ok": True, "compared": 0}
-
-            if action.type == "rank_results":
-                ranked = self._rank_results(context=context, query_profile=query_profile, community_index=community_index)
-                return {"ok": True, **ranked}
-
-            if action.type == "summarize_with_citations":
-                note = self._build_cited_summary(context=context)
-                if note:
-                    context["analysis_notes"].append(note)
-                    return {"ok": True, "summary_added": True}
-                return {"ok": True, "summary_added": False}
-
-            if action.type == "extract_actionable_advice":
-                advice = self._extract_actionable_advice(context=context)
-                if advice:
-                    context["actionable_advice"].extend(advice)
-                return {"ok": True, "advice_items": len(advice)}
-
-            if action.type == "list_communities":
-                communities = context["communities"]
-                q = str(action.args.get("query", "")).strip().lower()
-                limit = int(action.args.get("limit", 12))
-                if q:
-                    ranked = [
-                        c
-                        for c in communities
-                        if q in str(c.get("name", "")).lower() or q in str(c.get("description", "")).lower()
-                    ]
-                    context["communities"] = ranked[: max(1, min(limit, 30))]
-                else:
-                    context["communities"] = communities[: max(1, min(limit, 30))]
-                context["selected_community_ids"] = {
-                    cid for cid in (self._to_int(c.get("id")) for c in context["communities"]) if cid is not None
-                }
-                if community_focus:
-                    self._filter_posts_by_selected_communities(context["posts"], context["selected_community_ids"])
-                self._apply_query_constraints(context=context, query_profile=query_profile, community_index=community_index)
-                return {"ok": True, "communities_selected": len(context["communities"])}
-
-            if action.type == "get_community_flairs":
-                community_id = int(action.args.get("community_id", 0))
-                if community_id <= 0:
-                    return {"ok": False, "error": "missing community_id"}
-                flairs = await self.backend.list_flairs(community_id)
-                names = [str(item.get("name", "")).strip() for item in flairs if item.get("name")]
-                context["flairs"].extend(names)
-                context["flairs_loaded_for"].add(community_id)
-                if community_id in community_index:
-                    community_index[community_id]["_flairs"] = names
-                return {"ok": True, "flairs_added": len(names)}
-
-            if action.type == "get_post_comments":
-                post_id = int(action.args.get("post_id", 0))
-                if post_id <= 0:
-                    return {"ok": False, "error": "missing post_id"}
-                comments = await self.backend.get_post_comments(post_id, user_id=user_id)
-                context["comments_by_post"][str(post_id)] = comments[:30]
-                self._refresh_matched_comments_from_query(context=context, query=str(action.args.get("query", "")))
-                return {"ok": True, "comments_loaded": len(comments)}
-
-            if action.type == "get_trending_posts":
-                sort = str(action.args.get("sort", "HOT")).upper()
-                window = str(action.args.get("window", "ALL")).upper()
-                limit = int(action.args.get("limit", 8))
-                posts = await self.backend.get_trending_posts(user_id=user_id, sort=sort, window=window, limit=limit)
-                posts = self._filter_posts_by_freshness(posts, query_profile["freshness_days"])
-                self._merge_posts(context["posts"], posts)
-                self._collect_flairs(context["flairs"], posts)
-                self._apply_query_constraints(context=context, query_profile=query_profile, community_index=community_index)
-                return {"ok": True, "trending_added": len(posts)}
-
-            if action.type == "search_flairs":
-                q = str(action.args.get("query", "")).strip()
-                if not q:
-                    return {"ok": False, "error": "missing query"}
-                flairs = await self.backend.search_flairs_by_name(q, context["communities"])
-                if flairs:
-                    context["flairs"].extend([f.get("name") for f in flairs if f.get("name")])
-                return {"ok": True, "flairs_found": len(flairs)}
-
-            if action.type == "search_rules":
-                q = str(action.args.get("query", "")).strip()
-                if not q:
-                    return {"ok": False, "error": "missing query"}
-                rules = await self.backend.search_rules_by_content(q, context["communities"])
-                if rules:
-                    context["rules"].extend(rules)
-                return {"ok": True, "rules_found": len(rules)}
-
-            return {"ok": False, "error": f"unsupported action: {action.type}"}
+            return await handler(action, context, user_id, community_index, community_focus, query_profile)
+        except httpx.HTTPStatusError as ex:
+            status_code = ex.response.status_code
+            if status_code == 404:
+                return {"ok": False, "error": "not_found", "error_type": "http_404"}
+            if status_code >= 500:
+                raise RuntimeError(f"Backend action '{action.type}' failed with HTTP {status_code}") from ex
+            return {"ok": False, "error": str(ex), "error_type": f"http_{status_code}"}
+        except (httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.NetworkError, httpx.TimeoutException) as ex:
+            raise RuntimeError(f"Backend action '{action.type}' failed due to connection issue: {ex}") from ex
         except Exception as ex:
-            return {"ok": False, "error": str(ex)}
+            return {"ok": False, "error": str(ex), "error_type": type(ex).__name__}
+
+    async def _handle_search_posts(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        q = str(action.args.get("query", "")).strip()
+        if not q:
+            return {"ok": False, "error": "missing query", "error_type": "validation"}
+        limit = int(action.args.get("limit", 16))
+        posts = await self.backend.search_posts(q, user_id=user_id, limit=limit)
+        posts = self._filter_posts_by_freshness(posts, query_profile["freshness_days"])
+        self._merge_posts(context["posts"], posts)
+        self._collect_flairs(context["flairs"], posts)
+        return {"ok": True, "posts_added": len(posts)}
+
+    async def _handle_search_comments(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        q = str(action.args.get("query", "")).strip()
+        if not q:
+            return {"ok": False, "error": "missing query", "error_type": "validation"}
+        limit_posts = int(action.args.get("limit_posts", 6))
+        limit_comments = int(action.args.get("limit_comments_per_post", 20))
+        comments = await self._search_comments(
+            query=q,
+            posts=context["posts"][: max(1, min(limit_posts, 12))],
+            user_id=user_id,
+            limit_per_post=limit_comments,
+        )
+        self._merge_comments(context["matched_comments"], comments)
+        return {"ok": True, "comments_found": len(comments)}
+
+    async def _handle_get_user_posts(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        username = str(action.args.get("username", query_profile.get("author_target", ""))).strip()
+        if not username:
+            return {"ok": False, "error": "missing username", "error_type": "validation"}
+        limit = int(action.args.get("limit", 20))
+        date_filter = query_profile.get("date_filter")
+        posts = await self.backend.get_user_posts(
+            username,
+            user_id=user_id,
+            limit=limit,
+            day=self._to_int((date_filter or {}).get("day")),
+            month=self._to_int((date_filter or {}).get("month")),
+            year=self._to_int((date_filter or {}).get("year")),
+        )
+        posts = self._filter_posts_by_freshness(posts, query_profile["freshness_days"])
+        posts = self._filter_posts_by_date_filter(posts, date_filter)
+        self._merge_posts(context["posts"], posts)
+        self._collect_flairs(context["flairs"], posts)
+        return {"ok": True, "posts_added": len(posts), "username": username}
+
+    async def _handle_get_user_comments(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        username = str(action.args.get("username", query_profile.get("author_target", ""))).strip().lower()
+        if not username:
+            return {"ok": False, "error": "missing username", "error_type": "validation"}
+        await self._ensure_comment_context(context=context, user_id=user_id, trace=[])
+        user_comments = []
+        for post in context["posts"][:12]:
+            post_id = self._to_int(post.get("id"))
+            if post_id is None:
+                continue
+            for comment in self._flatten_comments(context["comments_by_post"].get(str(post_id), []), post_id=post_id):
+                if username in str(comment.get("authorName", "")).strip().lower():
+                    user_comments.append(comment)
+        self._merge_comments(context["matched_comments"], user_comments)
+        return {"ok": True, "comments_found": len(user_comments), "username": username}
+
+    async def _handle_get_post_by_id(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        post_id = int(action.args.get("post_id", 0))
+        if post_id <= 0:
+            return {"ok": False, "error": "missing post_id", "error_type": "validation"}
+        post = await self.backend.get_post_by_id(post_id, user_id=user_id)
+        if not post:
+            return {"ok": True, "post_found": False}
+        self._merge_posts(context["posts"], [post])
+        self._collect_flairs(context["flairs"], [post])
+        return {"ok": True, "post_found": True}
+
+    async def _handle_get_related_posts(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        post_id = int(action.args.get("post_id", 0))
+        if post_id <= 0:
+            return {"ok": False, "error": "missing post_id", "error_type": "validation"}
+        related = await self._get_related_posts(
+            post_id=post_id,
+            context=context,
+            user_id=user_id,
+            limit=int(action.args.get("limit", 8)),
+        )
+        self._merge_posts(context["posts"], related)
+        self._collect_flairs(context["flairs"], related)
+        return {"ok": True, "related_added": len(related)}
+
+    async def _handle_get_flair_trends(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        trends = self._build_flair_trends(context["posts"])
+        for trend in trends:
+            context["flairs"].append(trend["name"])
+        context["ranking_factors"].append({"factor": "flair_trends", "top": trends[:5]})
+        return {"ok": True, "trends_found": len(trends)}
+
+    async def _handle_compare_communities(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        comparison = self._compare_communities(context=context, query_profile=query_profile)
+        if comparison:
+            context["community_comparisons"].append(comparison)
+            context["analysis_notes"].append(f"Comparison: {comparison.get('summary', '')}".strip())
+            return {"ok": True, "compared": len(comparison.get("items", []))}
+        return {"ok": True, "compared": 0}
+
+    async def _handle_rank_results(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        ranked = self._rank_results(context=context, query_profile=query_profile, community_index=community_index)
+        return {"ok": True, **ranked}
+
+    async def _handle_summarize_with_citations(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        note = self._build_cited_summary(context=context)
+        if note:
+            context["analysis_notes"].append(note)
+            return {"ok": True, "summary_added": True}
+        return {"ok": True, "summary_added": False}
+
+    async def _handle_extract_actionable_advice(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        advice = self._extract_actionable_advice(context=context)
+        if advice:
+            context["actionable_advice"].extend(advice)
+        return {"ok": True, "advice_items": len(advice)}
+
+    async def _handle_list_communities(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        communities = context["communities"]
+        q = str(action.args.get("query", "")).strip().lower()
+        limit = int(action.args.get("limit", 12))
+        if q:
+            ranked = [
+                community
+                for community in communities
+                if q in str(community.get("name", "")).lower() or q in str(community.get("description", "")).lower()
+            ]
+            context["communities"] = ranked[: max(1, min(limit, 30))]
+        else:
+            context["communities"] = communities[: max(1, min(limit, 30))]
+        context["selected_community_ids"] = {
+            cid for cid in (self._to_int(community.get("id")) for community in context["communities"]) if cid is not None
+        }
+        if community_focus:
+            self._filter_posts_by_selected_communities(context["posts"], context["selected_community_ids"])
+        return {"ok": True, "communities_selected": len(context["communities"])}
+
+    async def _handle_get_community_flairs(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        community_id = int(action.args.get("community_id", 0))
+        if community_id <= 0:
+            return {"ok": False, "error": "missing community_id", "error_type": "validation"}
+        flairs = await self.backend.list_flairs(community_id)
+        names = [str(item.get("name", "")).strip() for item in flairs if item.get("name")]
+        context["flairs"].extend(names)
+        context["flairs_loaded_for"].add(community_id)
+        if community_id in community_index:
+            community_index[community_id]["_flairs"] = names
+        return {"ok": True, "flairs_added": len(names)}
+
+    async def _handle_get_post_comments(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        post_id = int(action.args.get("post_id", 0))
+        if post_id <= 0:
+            return {"ok": False, "error": "missing post_id", "error_type": "validation"}
+        comments = await self.backend.get_post_comments(post_id, user_id=user_id)
+        context["comments_by_post"][str(post_id)] = comments[: self.MAX_COMMENTS]
+        self._refresh_matched_comments_from_query(context=context, query=str(action.args.get("query", "")))
+        return {"ok": True, "comments_loaded": len(comments)}
+
+    async def _handle_get_trending_posts(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        sort = str(action.args.get("sort", "HOT")).upper()
+        window = str(action.args.get("window", "ALL")).upper()
+        limit = int(action.args.get("limit", 8))
+        posts = await self.backend.get_trending_posts(user_id=user_id, sort=sort, window=window, limit=limit)
+        posts = self._filter_posts_by_freshness(posts, query_profile["freshness_days"])
+        self._merge_posts(context["posts"], posts)
+        self._collect_flairs(context["flairs"], posts)
+        return {"ok": True, "trending_added": len(posts)}
+
+    async def _handle_search_flairs(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        q = str(action.args.get("query", "")).strip()
+        if not q:
+            return {"ok": False, "error": "missing query", "error_type": "validation"}
+        flairs = await self.backend.search_flairs_by_name(q, context["communities"])
+        if flairs:
+            context["flairs"].extend([flair.get("name") for flair in flairs if flair.get("name")])
+        return {"ok": True, "flairs_found": len(flairs)}
+
+    async def _handle_search_rules(
+        self,
+        action: AgentAction,
+        context: dict[str, Any],
+        user_id: int | None,
+        community_index: dict[int, dict[str, Any]],
+        community_focus: bool,
+        query_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        q = str(action.args.get("query", "")).strip()
+        if not q:
+            return {"ok": False, "error": "missing query", "error_type": "validation"}
+        rules = await self.backend.search_rules_by_content(q, context["communities"])
+        if rules:
+            context["rules"].extend(rules)
+        return {"ok": True, "rules_found": len(rules)}
 
     async def _synthesize(
         self,
@@ -479,35 +713,25 @@ class CommunitySearchAgent:
         normalized_query: str,
         context: dict[str, Any],
         query_profile: dict[str, Any],
+        trace: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        user_context = self._collect_user_context(context["posts"], context["comments_by_post"])
-        prompt = (
-            "You are a community assistant. Use only the provided evidence.\n"
-            "Return ONLY JSON with schema:\n"
-            '{"answer":"...", "follow_ups":["...","...","..."], "confidence":0.0, "gaps":["..."]}\n'
-            "Rules:\n"
-            "- answer: 3-6 sentences, practical, contextual.\n"
-            "- Include comparative/recommendation framing when user intent asks for it.\n"
-            "- Mention what drove ranking decisions when recommendation_mode=true.\n"
-            "- If evidence is weak, list concrete gaps.\n"
-            "- Never invent posts, comments, or metrics.\n\n"
-            f"User query: {query}\n"
-            f"Normalized query: {normalized_query}\n\n"
-            f"Query profile: {json.dumps(query_profile, ensure_ascii=False)}\n"
-            f"Posts: {json.dumps(self._trim_posts(context['posts'], context['why_post']), ensure_ascii=False)}\n"
-            f"Communities: {json.dumps(self._trim_communities(context['communities'], context['why_community']), ensure_ascii=False)}\n"
-            f"Comments: {json.dumps(self._trim_comments(context['matched_comments']), ensure_ascii=False)}\n"
-            f"Flairs: {json.dumps(self._trim_flairs(context['flairs']), ensure_ascii=False)}\n"
-            f"Rules: {json.dumps(self._trim_rules(context['rules']), ensure_ascii=False)}\n"
-            f"Ranking factors: {json.dumps(context['ranking_factors'][:6], ensure_ascii=False)}\n"
-            f"Analysis notes: {json.dumps(context['analysis_notes'][:4], ensure_ascii=False)}\n"
-            f"Actionable advice: {json.dumps(context['actionable_advice'][:5], ensure_ascii=False)}\n"
-            f"Users in scope: {json.dumps(user_context, ensure_ascii=False)}\n"
-            f"Comments by post: {json.dumps(context['comments_by_post'], ensure_ascii=False)}\n"
-        )
-
-        raw = await self._groq_json(prompt)
+        prompt_context = {
+            "trimmed_posts": self._trim_posts(context["posts"], context["why_post"]),
+            "trimmed_communities": self._trim_communities(context["communities"], context["why_community"]),
+            "trimmed_comments": self._trim_comments(context["matched_comments"]),
+            "trimmed_flairs": self._trim_flairs(context["flairs"]),
+            "trimmed_rules": self._trim_rules(context["rules"]),
+            "ranking_factors": context["ranking_factors"],
+            "analysis_notes": context["analysis_notes"],
+            "actionable_advice": context["actionable_advice"],
+            "user_context": self._collect_user_context(context["posts"], context["comments_by_post"]),
+            "comments_by_post": context["comments_by_post"],
+        }
+        prompt = build_synthesis_prompt(query=query, normalized_query=normalized_query, context=prompt_context, query_profile=query_profile)
+        raw = await self._groq_json(prompt, caller="_synthesize", trace=trace)
         parsed = self._parse_json_candidate(raw)
+        if parsed is None:
+            trace.append({"step": "llm_parse_failure", "caller": "_synthesize", "raw_preview": raw[:300]})
         if not isinstance(parsed, dict):
             return {
                 "answer": raw.strip() or "I could not build a reliable answer from the available context.",
@@ -527,10 +751,20 @@ class CommunitySearchAgent:
         gaps = self._normalize_gaps(parsed.get("gaps"), context=context, query_profile=query_profile)
         return {"answer": answer, "follow_ups": follow_ups, "confidence": confidence, "gaps": gaps, "model": self.groq_model}
 
-    async def _groq_json(self, prompt: str) -> str:
-        # Try Groq first if selected, fallback to Ollama if fails or if provider is ollama
-        if self.llm_provider == "ollama":
-            return await self._ollama_json(prompt)
+    async def _groq_json(self, prompt: str, caller: str, trace: list[dict[str, Any]] | None = None) -> str:
+        import asyncio
+        prompt_chars = len(prompt)
+        if trace is not None:
+            trace.append({"step": "prompt_size", "caller": caller, "chars": prompt_chars})
+            if prompt_chars > 12000:
+                trace.append({"step": "prompt_size_warning", "caller": caller, "chars": prompt_chars})
+
+        api_keys = os.getenv("GROQ_API_KEYS")
+        if api_keys:
+            key_list = [k.strip() for k in api_keys.split(",") if k.strip()]
+        else:
+            key_list = [os.getenv("GROQ_API_KEY", getattr(self, "groq_api_key", ""))]
+
         payload = {
             "model": self.groq_model,
             "temperature": 0.2,
@@ -538,31 +772,59 @@ class CommunitySearchAgent:
             "response_format": {"type": "json_object"},
             "messages": [{"role": "user", "content": prompt}],
         }
-        headers = {"Authorization": f"Bearer {self.groq_api_key}", "Content-Type": "application/json"}
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(25)) as client:
-                response = await client.post(self.groq_url, headers=headers, json=payload)
-                response.raise_for_status()
-                data = response.json()
-                return str(data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
-        except Exception as ex:
-            # Fallback to Ollama if Groq fails
-            return await self._ollama_json(prompt)
+        retryable_statuses = {429, 503}
 
-    async def _ollama_json(self, prompt: str) -> str:
-        payload = {
-            "model": self.ollama_model,
-            "format": "json",
-            "messages": [{"role": "user", "content": prompt}],
-            "options": {"temperature": 0.2, "num_predict": 900}
-        }
-        async with httpx.AsyncClient(timeout=httpx.Timeout(25)) as client:
-            response = await client.post(f"{self.ollama_base_url}/api/chat", json=payload)
-            response.raise_for_status()
-            data = response.json()
-            # Ollama returns the result in 'message' or 'response' depending on version
-            content = data.get("message", {}).get("content") or data.get("response")
-            return str(content or "").strip()
+        async def try_key(api_key, key_idx):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(25)) as client:
+                for attempt in range(3):
+                    try:
+                        if trace is not None:
+                            trace.append({"step": "groq_try_key", "caller": caller, "api_key": key_idx, "attempt": attempt + 1})
+                        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                        response = await client.post(self.groq_url, headers=headers, json=payload)
+                        response.raise_for_status()
+                        data = response.json()
+                        return str(data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+                    except httpx.TimeoutException as ex:
+                        if attempt < 2:
+                            if trace is not None:
+                                trace.append({"step": "groq_retry", "caller": caller, "api_key": key_idx, "attempt": attempt + 1, "error_type": type(ex).__name__})
+                            await asyncio.sleep(2**attempt)
+                            continue
+                        break
+                    except httpx.HTTPStatusError as ex:
+                        status = ex.response.status_code
+                        if status == 429:
+                            if trace is not None:
+                                trace.append({"step": "groq_rate_limited", "caller": caller, "api_key": key_idx, "attempt": attempt + 1, "error_type": f"http_{status}"})
+                            break
+                        if status in retryable_statuses and attempt < 2:
+                            if trace is not None:
+                                trace.append({"step": "groq_retry", "caller": caller, "api_key": key_idx, "attempt": attempt + 1, "error_type": f"http_{status}"})
+                            await asyncio.sleep(2**attempt)
+                            continue
+                        if trace is not None:
+                            trace.append({"step": "groq_http_error_next_key", "caller": caller, "api_key": key_idx, "status": status})
+                        break
+                    except Exception as ex:
+                        if trace is not None:
+                            trace.append({"step": "groq_exception_next_key", "caller": caller, "api_key": key_idx, "error": str(ex)})
+                        break
+            return None
+
+        tasks = [asyncio.create_task(try_key(api_key, idx)) for idx, api_key in enumerate(key_list)]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in done:
+            result = task.result()
+            if result:
+                return result
+        if trace is not None:
+            trace.append({"step": "groq_all_keys_failed", "caller": caller})
+        raise RuntimeError("All GROQ API keys failed or were rate-limited.")
+
+
 
     def _parse_json_candidate(self, raw: str) -> dict[str, Any] | None:
         source = (raw or "").strip().replace("```json", "").replace("```", "").strip()
@@ -584,26 +846,26 @@ class CommunitySearchAgent:
         return None
 
     def _merge_posts(self, base: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> None:
-        seen = {self._to_int(p.get("id")) for p in base}
+        seen = {self._to_int(post.get("id")) for post in base}
         for post in incoming:
             post_id = self._to_int(post.get("id"))
             if post_id in seen:
                 continue
             base.append(post)
             seen.add(post_id)
-        base.sort(key=lambda p: (int(p.get("voteScore", 0)), int(p.get("commentCount", 0))), reverse=True)
-        del base[40:]
+        base.sort(key=lambda post: (int(post.get("voteScore", 0)), int(post.get("commentCount", 0))), reverse=True)
+        del base[self.MAX_POSTS :]
 
     def _merge_comments(self, base: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> None:
-        seen = {(self._to_int(c.get("postId")), self._to_int(c.get("id"))) for c in base}
+        seen = {(self._to_int(comment.get("postId")), self._to_int(comment.get("id"))) for comment in base}
         for comment in incoming:
             key = (self._to_int(comment.get("postId")), self._to_int(comment.get("id")))
             if key in seen:
                 continue
             base.append(comment)
             seen.add(key)
-        base.sort(key=lambda c: int(c.get("score", 0)), reverse=True)
-        del base[60:]
+        base.sort(key=lambda comment: int(comment.get("score", 0)), reverse=True)
+        del base[self.MAX_COMMENTS :]
 
     def _collect_flairs(self, flair_list: list[str], posts: list[dict[str, Any]]) -> None:
         for post in posts:
@@ -613,7 +875,7 @@ class CommunitySearchAgent:
 
     def _trim_posts(self, posts: list[dict[str, Any]], why_map: dict[int, str] | None = None) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        for post in posts[:20]:
+        for post in posts[: self.MAX_POSTS]:
             post_id = self._to_int(post.get("id")) or 0
             out.append(
                 {
@@ -637,7 +899,7 @@ class CommunitySearchAgent:
 
     def _trim_communities(self, communities: list[dict[str, Any]], why_map: dict[int, str] | None = None) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        for community in communities[:20]:
+        for community in communities[: self.MAX_COMMUNITIES]:
             community_id = self._to_int(community.get("id")) or 0
             out.append(
                 {
@@ -658,7 +920,7 @@ class CommunitySearchAgent:
 
     def _trim_comments(self, comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        for comment in comments[:40]:
+        for comment in comments[: self.MAX_COMMENTS]:
             out.append(
                 {
                     "id": comment.get("id"),
@@ -692,7 +954,7 @@ class CommunitySearchAgent:
                     "order": rule.get("order"),
                 }
             )
-            if len(out) == 20:
+            if len(out) == self.MAX_COMMUNITIES:
                 break
         return out
 
@@ -744,7 +1006,7 @@ class CommunitySearchAgent:
                 user_id=user_id,
                 sort="HOT",
                 window="ALL",
-                limit=20,
+                limit=self.MAX_COMMUNITIES,
             )
         except Exception:
             return []
@@ -756,29 +1018,37 @@ class CommunitySearchAgent:
         return flairs
 
     async def _auto_load_flairs(self, context: dict[str, Any], user_id: int | None, trace: list[dict[str, Any]]) -> None:
-        selected_community_ids = list(context["selected_community_ids"])[:3]
-        for community_id in selected_community_ids:
-            if community_id in context["flairs_loaded_for"]:
-                continue
+        selected_community_ids = [community_id for community_id in list(context["selected_community_ids"])[:3] if community_id not in context["flairs_loaded_for"]]
+        semaphore = asyncio.Semaphore(5)
+
+        async def load_one(community_id: int) -> dict[str, Any]:
             try:
-                flairs = await self.backend.list_flairs(community_id)
+                async with semaphore:
+                    flairs = await self.backend.list_flairs(community_id)
                 names = [str(item.get("name", "")).strip() for item in flairs if item.get("name")]
-                context["flairs"].extend(names)
-                context["flairs_loaded_for"].add(community_id)
-                trace.append({"step": "auto_flairs", "community_id": community_id, "flairs_added": len(names)})
+                return {"community_id": community_id, "names": names}
             except Exception as ex:
                 fallback_names = await self._fallback_flairs_from_posts(community_id=community_id, user_id=user_id)
-                context["flairs"].extend(fallback_names)
-                if fallback_names:
-                    context["flairs_loaded_for"].add(community_id)
-                trace.append(
-                    {
-                        "step": "auto_flairs",
-                        "community_id": community_id,
-                        "error": str(ex),
-                        "fallback_flairs_added": len(fallback_names),
-                    }
-                )
+                return {"community_id": community_id, "names": fallback_names, "error": str(ex), "fallback": True}
+
+        for outcome in await asyncio.gather(*(load_one(community_id) for community_id in selected_community_ids), return_exceptions=True):
+            if isinstance(outcome, Exception):
+                trace.append({"step": "auto_flairs", "error": str(outcome), "error_type": type(outcome).__name__})
+                continue
+            community_id = outcome["community_id"]
+            names = outcome.get("names", [])
+            context["flairs"].extend(names)
+            if names:
+                context["flairs_loaded_for"].add(community_id)
+            trace.append(
+                {
+                    "step": "auto_flairs",
+                    "community_id": community_id,
+                    "flairs_added": len(names),
+                    "error": outcome.get("error"),
+                    "fallback_flairs_added": len(names) if outcome.get("fallback") else 0,
+                }
+            )
 
     async def _ensure_comment_context(self, context: dict[str, Any], user_id: int | None, trace: list[dict[str, Any]]) -> None:
         top_posts = sorted(
@@ -786,26 +1056,52 @@ class CommunitySearchAgent:
             key=lambda post: (int(post.get("voteScore", 0)), int(post.get("commentCount", 0))),
             reverse=True,
         )[:6]
-        for post in top_posts:
+        semaphore = asyncio.Semaphore(5)
+
+        async def load_comments(post: dict[str, Any]) -> dict[str, Any]:
             post_id = self._to_int(post.get("id"))
             if post_id is None:
-                continue
+                return {"skip": True}
             key = str(post_id)
             if key in context["comments_by_post"]:
-                continue
+                return {"skip": True, "post_id": post_id}
             try:
-                comments = await self.backend.get_post_comments(post_id, user_id=user_id)
-                context["comments_by_post"][key] = comments[:40]
-                trace.append({"step": "auto_comments", "post_id": post_id, "comments_loaded": len(comments)})
+                async with semaphore:
+                    comments = await self.backend.get_post_comments(post_id, user_id=user_id)
+                return {"post_id": post_id, "comments": comments}
             except Exception as ex:
-                trace.append({"step": "auto_comments", "post_id": post_id, "error": str(ex)})
+                return {"post_id": post_id, "error": str(ex), "error_type": type(ex).__name__}
 
-    async def _build_query_profile(self, query: str) -> dict[str, Any]:
+        for outcome in await asyncio.gather(*(load_comments(post) for post in top_posts), return_exceptions=True):
+            if isinstance(outcome, Exception):
+                trace.append({"step": "auto_comments", "error": str(outcome), "error_type": type(outcome).__name__})
+                continue
+            if outcome.get("skip"):
+                continue
+            post_id = outcome["post_id"]
+            if "comments" in outcome:
+                comments = outcome["comments"]
+                context["comments_by_post"][str(post_id)] = comments[: self.MAX_COMMENTS]
+                trace.append({"step": "auto_comments", "post_id": post_id, "comments_loaded": len(comments)})
+            else:
+                trace.append(
+                    {
+                        "step": "auto_comments",
+                        "post_id": post_id,
+                        "error": outcome.get("error"),
+                        "error_type": outcome.get("error_type"),
+                    }
+                )
+
+    async def _build_query_profile(self, query: str, trace: list[dict[str, Any]]) -> dict[str, Any]:
+        heuristic_profile = self._build_heuristic_query_profile(query)
+        llm_profile = await self._interpret_query_with_llm(query, trace=trace)
+        merged_profile = self._merge_query_profiles(heuristic_profile, llm_profile or {})
+        merged_profile.setdefault("date_filter", heuristic_profile.get("date_filter"))
+        return merged_profile
+
+    def _build_heuristic_query_profile(self, query: str) -> dict[str, Any]:
         lowered = (query or "").strip().lower()
-        llm_profile = await self._interpret_query_with_llm(query)
-        if llm_profile:
-            return llm_profile
-
         author_target = self._extract_author_target(lowered)
         animals = sorted(self._extract_animals(lowered))
         topic_tokens = [token for token in self._tokenize(lowered) if token not in self.STOP_WORDS]
@@ -827,37 +1123,16 @@ class CommunitySearchAgent:
             "recommendation_mode": recommendation_mode,
             "explainability_mode": explainability_mode,
             "multi_hop_mode": True,
+            "date_filter": self._extract_date_filter(query),
         }
 
-    async def _interpret_query_with_llm(self, query: str) -> dict[str, Any] | None:
-        prompt = (
-            "Analyze this community search query and extract key information.\n"
-            "Return ONLY valid JSON with this exact schema:\n"
-            "{"
-            '"author_target": null or "username",'
-            '"animals": [] or ["dog", "cat"] etc.,'
-            '"search_query": "what to actually search for",'
-            '"is_author_query": true/false,'
-            '"is_animal_query": true/false,'
-            '"result_type": "posts" or "communities" or "flairs" or "rules" or "all",'
-            '"freshness_days": null or integer,'
-            '"comparison_mode": true/false,'
-            '"recommendation_mode": true/false,'
-            '"explainability_mode": true/false'
-            "}\n\n"
-            "Rules:\n"
-            "- author_target: extract username for 'posts by/from someone'.\n"
-            "- animals: dog, cat, bird, fish, rabbit, hamster, guinea_pig, parrot.\n"
-            "- freshness_days: parse phrases like 'last 7 days', 'past month' into days.\n"
-            "- comparison_mode: true when user asks to compare options.\n"
-            "- recommendation_mode: true when user asks for best/top/ranked picks.\n"
-            "- explainability_mode: true when user asks why/reasons OR recommendations are requested.\n"
-            "- result_type defaults to 'all' when unclear.\n\n"
-            f"User query: {query}"
-        )
+    async def _interpret_query_with_llm(self, query: str, trace: list[dict[str, Any]]) -> dict[str, Any] | None:
+        prompt = build_query_profile_prompt(query)
         try:
-            raw = await self._groq_json(prompt)
+            raw = await self._groq_json(prompt, caller="_interpret_query_with_llm", trace=trace)
             parsed = self._parse_json_candidate(raw)
+            if parsed is None:
+                trace.append({"step": "llm_parse_failure", "caller": "_interpret_query_with_llm", "raw_preview": raw[:300]})
             if not isinstance(parsed, dict):
                 return None
 
@@ -877,12 +1152,11 @@ class CommunitySearchAgent:
             if result_type not in ("posts", "communities", "flairs", "rules", "all"):
                 result_type = "all"
             freshness_days = self._coerce_days(parsed.get("freshness_days"))
-            if freshness_days is None:
-                freshness_days = self._extract_freshness_days((query or "").lower())
-
-            recommendation_mode = bool(parsed.get("recommendation_mode", False))
+            recommendation_confidence = self._coerce_confidence(parsed.get("recommendation_confidence"))
+            comparison_confidence = self._coerce_confidence(parsed.get("comparison_confidence"))
+            recommendation_mode = recommendation_confidence >= 0.65 and bool(parsed.get("recommendation_mode", False))
+            comparison_mode = comparison_confidence >= 0.65 and bool(parsed.get("comparison_mode", False))
             explainability_mode = bool(parsed.get("explainability_mode", False)) or recommendation_mode
-            comparison_mode = bool(parsed.get("comparison_mode", False))
             is_author = bool(parsed.get("is_author_query", False))
             is_animal = bool(parsed.get("is_animal_query", False))
 
@@ -891,53 +1165,166 @@ class CommunitySearchAgent:
                 "strict_author": is_author and author_target is not None,
                 "animals": animals,
                 "strict_animals": is_animal and bool(animals),
-                "topic_tokens": self._tokenize(search_query or "") if search_query else [],
+                "topic_tokens": self._tokenize(search_query or "")[:10] if search_query else [],
                 "result_type": result_type,
                 "freshness_days": freshness_days,
                 "comparison_mode": comparison_mode,
                 "recommendation_mode": recommendation_mode,
+                "recommendation_confidence": recommendation_confidence,
+                "comparison_confidence": comparison_confidence,
                 "explainability_mode": explainability_mode,
                 "multi_hop_mode": True,
                 "llm_interpreted": True,
+                "date_filter": self._extract_date_filter(query),
             }
         except Exception:
             return None
 
+    def _merge_query_profiles(self, heuristic_profile: dict[str, Any], llm_profile: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(heuristic_profile)
+        for key, value in llm_profile.items():
+            if not self._is_empty_profile_value(value):
+                merged[key] = value
+        for key, heuristic_value in heuristic_profile.items():
+            if key not in merged or self._is_empty_profile_value(merged.get(key)):
+                merged[key] = heuristic_value
+        return merged
+
+    def _is_empty_profile_value(self, value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return not value.strip()
+        if isinstance(value, (list, dict, set, tuple)):
+            return len(value) == 0
+        return False
+
+    def _extract_date_filter(self, query: str) -> dict[str, Any] | None:
+        lowered = (query or "").strip().lower()
+        if not lowered:
+            return None
+
+        quarter_match = re.search(r"\bq([1-4])\s+(\d{4})\b", lowered)
+        if quarter_match:
+            quarter = int(quarter_match.group(1))
+            year = int(quarter_match.group(2))
+            month_start, month_end = self.QUARTERS[quarter]
+            return {"day": None, "month": month_start, "year": year, "month_range": [month_start, month_end]}
+
+        iso_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", lowered)
+        if iso_match:
+            year, month, day = map(int, iso_match.groups())
+            return self._validated_date_filter(day=day, month=month, year=year)
+
+        slash_match = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", lowered)
+        if slash_match:
+            day, month, year = map(int, slash_match.groups())
+            return self._validated_date_filter(day=day, month=month, year=year)
+
+        month_names = "|".join(self.MONTHS.keys())
+        month_first = re.search(rf"\b({month_names})\s+(\d{{1,2}})(?:\s+(\d{{4}}))?\b", lowered)
+        if month_first:
+            month = self.MONTHS[month_first.group(1)]
+            day = int(month_first.group(2))
+            year = int(month_first.group(3)) if month_first.group(3) else datetime.now(UTC).year
+            return self._validated_date_filter(day=day, month=month, year=year)
+
+        day_first = re.search(rf"\b(\d{{1,2}})\s+({month_names})(?:\s+(\d{{4}}))?\b", lowered)
+        if day_first:
+            day = int(day_first.group(1))
+            month = self.MONTHS[day_first.group(2)]
+            year = int(day_first.group(3)) if day_first.group(3) else datetime.now(UTC).year
+            return self._validated_date_filter(day=day, month=month, year=year)
+
+        month_only = re.search(rf"\b({month_names})(?:\s+(\d{{4}}))?\b", lowered)
+        if month_only:
+            month = self.MONTHS[month_only.group(1)]
+            year = int(month_only.group(2)) if month_only.group(2) else datetime.now(UTC).year
+            return self._validated_date_filter(day=None, month=month, year=year)
+
+        return None
+
+    def _validated_date_filter(self, day: int | None, month: int | None, year: int | None) -> dict[str, Any] | None:
+        if year is None and month is None and day is None:
+            return None
+        try:
+            if year is not None and month is not None and day is not None:
+                datetime(year, month, day, tzinfo=UTC)
+            elif year is not None and month is not None:
+                datetime(year, month, 1, tzinfo=UTC)
+        except ValueError:
+            return None
+        return {"day": day, "month": month, "year": year}
+
+    def _filter_posts_by_date_filter(self, posts: list[dict[str, Any]], date_filter: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if not date_filter:
+            return posts
+        day = self._to_int(date_filter.get("day"))
+        month = self._to_int(date_filter.get("month"))
+        year = self._to_int(date_filter.get("year"))
+        month_range = date_filter.get("month_range")
+
+        filtered: list[dict[str, Any]] = []
+        for post in posts:
+            created = self._parse_dt(post.get("createdAt"))
+            if created is None:
+                continue
+            if year is not None and created.year != year:
+                continue
+            if isinstance(month_range, list) and len(month_range) == 2:
+                if not (int(month_range[0]) <= created.month <= int(month_range[1])):
+                    continue
+            elif month is not None and created.month != month:
+                continue
+            if day is not None and created.day != day:
+                continue
+            filtered.append(post)
+        return filtered
+
     def _augment_plan_for_profile(
-        self, plan: PlannerResponse, query: str, query_profile: dict[str, Any], action_budget: int
+        self,
+        plan: PlannerResponse,
+        query: str,
+        query_profile: dict[str, Any],
+        action_budget: int,
     ) -> PlannerResponse:
         actions = list(plan.actions)
         if query_profile["author_target"]:
             author_q = str(query_profile["author_target"])
-            if not any(a.type == "get_user_posts" for a in actions):
+            if not any(action.type == "get_user_posts" for action in actions):
                 actions.insert(0, AgentAction(type="get_user_posts", args={"username": author_q, "limit": 18}, reason="Collect author-specific posts"))
-            if not any(a.type == "get_user_comments" for a in actions):
+            if not any(action.type == "get_user_comments" for action in actions):
                 actions.append(AgentAction(type="get_user_comments", args={"username": author_q}, reason="Collect author-specific comment evidence"))
 
         if query_profile["animals"]:
             animal_q = str(query_profile["animals"][0])
-            if not any(a.type == "search_posts" and animal_q in str(a.args.get("query", "")).lower() for a in actions):
+            if not any(action.type == "search_posts" and animal_q in str(action.args.get("query", "")).lower() for action in actions):
                 actions.append(AgentAction(type="search_posts", args={"query": animal_q, "limit": 14}, reason="Fetch species-focused context"))
 
-        if query_profile["freshness_days"] is not None and not any(a.type == "rank_results" for a in actions):
+        if query_profile["freshness_days"] is not None and not any(action.type == "rank_results" for action in actions):
             actions.append(AgentAction(type="rank_results", args={"strategy": "freshness_weighted"}, reason="Enforce freshness-aware ranking"))
 
         if not actions:
             actions = self._default_plan(query).actions
         return PlannerResponse(normalized_query=plan.normalized_query, intent=plan.intent, actions=actions[:action_budget])
 
-    def _apply_mode_enhancements(self, plan: PlannerResponse, query: str, query_profile: dict[str, Any], action_budget: int) -> PlannerResponse:
+    def _apply_mode_enhancements(
+        self,
+        plan: PlannerResponse,
+        query: str,
+        query_profile: dict[str, Any],
+        action_budget: int,
+    ) -> PlannerResponse:
         actions = list(plan.actions)
-        if query_profile["multi_hop_mode"]:
-            if not any(a.type == "search_comments" for a in actions):
-                actions.append(AgentAction(type="search_comments", args={"query": query, "limit_posts": 6}, reason="Add discussion depth for multi-hop reasoning"))
-        if query_profile["comparison_mode"] and not any(a.type == "compare_communities" for a in actions):
+        if query_profile["multi_hop_mode"] and not any(action.type == "search_comments" for action in actions):
+            actions.append(AgentAction(type="search_comments", args={"query": query, "limit_posts": 6}, reason="Add discussion depth for multi-hop reasoning"))
+        if query_profile["comparison_mode"] and not any(action.type == "compare_communities" for action in actions):
             actions.append(AgentAction(type="compare_communities", args={}, reason="Generate side-by-side community comparison"))
-        if query_profile["recommendation_mode"] and not any(a.type == "rank_results" for a in actions):
+        if query_profile["recommendation_mode"] and not any(action.type == "rank_results" for action in actions):
             actions.append(AgentAction(type="rank_results", args={"strategy": "balanced"}, reason="Rank best options for recommendation"))
-        if not any(a.type == "summarize_with_citations" for a in actions):
+        if not any(action.type == "summarize_with_citations" for action in actions):
             actions.append(AgentAction(type="summarize_with_citations", args={}, reason="Provide citation-grounded summary notes"))
-        if not any(a.type == "extract_actionable_advice" for a in actions):
+        if not any(action.type == "extract_actionable_advice" for action in actions):
             actions.append(AgentAction(type="extract_actionable_advice", args={}, reason="Extract practical next steps from evidence"))
         return PlannerResponse(normalized_query=plan.normalized_query, intent=plan.intent, actions=actions[:action_budget])
 
@@ -992,7 +1379,10 @@ class CommunitySearchAgent:
         return self._extract_animals(haystack)
 
     def _apply_query_constraints(
-        self, context: dict[str, Any], query_profile: dict[str, Any], community_index: dict[int, dict[str, Any]]
+        self,
+        context: dict[str, Any],
+        query_profile: dict[str, Any],
+        community_index: dict[int, dict[str, Any]],
     ) -> None:
         requested_animals = set(query_profile["animals"])
         if requested_animals and context["communities"]:
@@ -1004,15 +1394,16 @@ class CommunitySearchAgent:
                 if requested_animals.intersection(self._extract_animals(haystack)):
                     scoped_communities.append(community)
             if scoped_communities:
-                context["communities"] = scoped_communities[:20]
+                context["communities"] = scoped_communities[: self.MAX_COMMUNITIES]
 
         context["posts"] = self._filter_posts_by_freshness(context["posts"], query_profile.get("freshness_days"))
+        context["posts"] = self._filter_posts_by_date_filter(context["posts"], query_profile.get("date_filter"))
         posts = context["posts"]
         if not posts:
             return
+
         author_target = query_profile["author_target"]
         topic_tokens = list(query_profile["topic_tokens"])
-
         scored: list[tuple[int, dict[str, Any]]] = []
         for post in posts:
             score = int(post.get("voteScore", 0)) + int(post.get("commentCount", 0)) * 2
@@ -1052,10 +1443,14 @@ class CommunitySearchAgent:
             animal_only = [post for post in filtered if requested_animals.intersection(self._post_animals(post, community_index))]
             if animal_only:
                 filtered = animal_only
-        context["posts"] = filtered[:40]
+        context["posts"] = filtered[: self.MAX_POSTS]
 
     async def _search_comments(
-        self, query: str, posts: list[dict[str, Any]], user_id: int | None, limit_per_post: int = 20
+        self,
+        query: str,
+        posts: list[dict[str, Any]],
+        user_id: int | None,
+        limit_per_post: int = 20,
     ) -> list[dict[str, Any]]:
         query_tokens = set(self._tokenize(query))
         if not query_tokens:
@@ -1073,7 +1468,7 @@ class CommunitySearchAgent:
                     flat["score"] = overlap
                     results.append(flat)
             if limit_per_post > 0:
-                results = sorted(results, key=lambda c: int(c.get("score", 0)), reverse=True)[: max(1, limit_per_post * len(posts))]
+                results = sorted(results, key=lambda comment: int(comment.get("score", 0)), reverse=True)[: max(1, limit_per_post * len(posts))]
         return results
 
     def _flatten_comments(self, comments: Any, post_id: int) -> list[dict[str, Any]]:
@@ -1105,7 +1500,7 @@ class CommunitySearchAgent:
         if not target:
             return []
         related: list[dict[str, Any]] = []
-        title_tokens = [t for t in self._tokenize(str(target.get("title", ""))) if t not in self.STOP_WORDS][:4]
+        title_tokens = [token for token in self._tokenize(str(target.get("title", ""))) if token not in self.STOP_WORDS][:4]
         flair = str(target.get("flairName", "")).strip()
         community_id = self._post_community_id(target)
 
@@ -1125,7 +1520,7 @@ class CommunitySearchAgent:
                 continue
             seen.add(candidate_id)
             dedup.append(post)
-            if len(dedup) >= max(1, min(limit, 20)):
+            if len(dedup) >= max(1, min(limit, self.MAX_COMMUNITIES)):
                 break
         return dedup
 
@@ -1141,22 +1536,28 @@ class CommunitySearchAgent:
             created = self._parse_dt(post.get("createdAt"))
             if created and (now - created) <= timedelta(days=7):
                 entry["recent"] += 1
-        ranked = sorted(trends.values(), key=lambda t: (int(t["recent"]), int(t["count"])), reverse=True)
-        return ranked[:20]
+        ranked = sorted(trends.values(), key=lambda trend: (int(trend["recent"]), int(trend["count"])), reverse=True)
+        return ranked[: self.MAX_COMMUNITIES]
 
     def _compare_communities(self, context: dict[str, Any], query_profile: dict[str, Any]) -> dict[str, Any] | None:
         communities = context["communities"][:6]
         if len(communities) < 2:
             return None
 
+        now = datetime.now(UTC)
         scored_items = []
         for community in communities:
             cid = self._to_int(community.get("id"))
-            posts = [p for p in context["posts"] if self._post_community_id(p) == cid]
-            avg_vote = (sum(int(p.get("voteScore", 0)) for p in posts) / len(posts)) if posts else 0.0
-            avg_comments = (sum(int(p.get("commentCount", 0)) for p in posts) / len(posts)) if posts else 0.0
+            posts = [post for post in context["posts"] if self._post_community_id(post) == cid]
+            avg_vote = (sum(int(post.get("voteScore", 0)) for post in posts) / len(posts)) if posts else 0.0
+            avg_comments = (sum(int(post.get("commentCount", 0)) for post in posts) / len(posts)) if posts else 0.0
             member_count = int(community.get("memberCount", 0) or 0)
-            score = avg_vote * 1.2 + avg_comments * 1.4 + (member_count / 1000)
+            post_density = 0.0
+            created_at = self._parse_dt(community.get("createdAt"))
+            if created_at is not None:
+                age_days = max((now - created_at).days, 1)
+                post_density = (len(posts) / age_days) * 30
+            score = avg_vote * 1.2 + avg_comments * 1.4 + (member_count / 1000) + (post_density * 2.0)
             scored_items.append(
                 {
                     "id": cid,
@@ -1165,21 +1566,36 @@ class CommunitySearchAgent:
                     "samplePosts": len(posts),
                     "avgVoteScore": round(avg_vote, 2),
                     "avgCommentCount": round(avg_comments, 2),
+                    "post_density": round(post_density, 3),
                     "score": round(score, 3),
                 }
             )
 
         scored_items.sort(key=lambda item: item["score"], reverse=True)
         summary = f"{scored_items[0]['name']} leads on overall activity signal against {scored_items[1]['name']}."
-        context["ranking_factors"].append({"factor": "community_comparison", "weights": {"votes": 1.2, "comments": 1.4, "members_k": 1.0}})
+        context["ranking_factors"].append(
+            {
+                "factor": "community_comparison",
+                "weights": {"votes": 1.2, "comments": 1.4, "members_k": 1.0, "post_density": 2.0},
+            }
+        )
         return {"summary": summary, "items": scored_items[:4], "mode": "side_by_side"}
 
     def _rank_results(
-        self, context: dict[str, Any], query_profile: dict[str, Any], community_index: dict[int, dict[str, Any]]
+        self,
+        context: dict[str, Any],
+        query_profile: dict[str, Any],
+        community_index: dict[int, dict[str, Any]],
     ) -> dict[str, int]:
         post_scores: list[tuple[float, dict[str, Any], str]] = []
         freshness_days = query_profile.get("freshness_days")
         now = datetime.now(UTC)
+        matched_comment_post_ids = {
+            post_id
+            for post_id in (self._to_int(comment.get("postId")) for comment in context["matched_comments"])
+            if post_id is not None
+        }
+
         for post in context["posts"]:
             votes = int(post.get("voteScore", 0))
             comments = int(post.get("commentCount", 0))
@@ -1189,36 +1605,50 @@ class CommunitySearchAgent:
             if freshness_days and created:
                 age_days = max(0.0, (now - created).total_seconds() / 86400)
                 freshness_bonus = max(0.0, 10.0 - age_days)
-            score = votes * 1.5 + comments * 2.0 + min(views / 100, 10) + freshness_bonus
+            matched_comment_bonus = 15.0 if (self._to_int(post.get("id")) or 0) in matched_comment_post_ids else 0.0
+            score = votes * 1.5 + comments * 2.0 + min(views / 100, 10) + freshness_bonus + matched_comment_bonus
             post_id = self._to_int(post.get("id")) or 0
-            why = f"votes={votes}, comments={comments}, freshness_bonus={round(freshness_bonus, 2)}"
+            why = (
+                f"votes={votes}, comments={comments}, freshness_bonus={round(freshness_bonus, 2)}, "
+                f"matched_comment_bonus={round(matched_comment_bonus, 2)}"
+            )
             post_scores.append((score, post, why))
             context["post_scores"][post_id] = round(score, 3)
             context["why_post"][post_id] = why
 
         post_scores.sort(key=lambda item: item[0], reverse=True)
-        context["posts"] = [item[1] for item in post_scores[:40]]
+        context["posts"] = [item[1] for item in post_scores[: self.MAX_POSTS]]
 
         community_scores: list[tuple[float, dict[str, Any], str]] = []
         for community in context["communities"]:
             cid = self._to_int(community.get("id"))
-            related_posts = [p for p in context["posts"] if self._post_community_id(p) == cid]
+            related_posts = [post for post in context["posts"] if self._post_community_id(post) == cid]
             member_count = int(community.get("memberCount", 0) or 0)
-            post_signal = sum(context["post_scores"].get(self._to_int(p.get("id")) or 0, 0.0) for p in related_posts[:6])
-            score = (member_count / 1500) + post_signal
-            why = f"member_count={member_count}, post_signal={round(post_signal, 2)}"
+            post_signal = sum(context["post_scores"].get(self._to_int(post.get("id")) or 0, 0.0) for post in related_posts[:6])
+            post_density = 0.0
+            created_at = self._parse_dt(community.get("createdAt"))
+            if created_at is not None:
+                age_days = max((now - created_at).days, 1)
+                post_density = (len(related_posts) / age_days) * 30
+            score = (member_count / 1500) + post_signal + (post_density * 2.0)
+            why = f"member_count={member_count}, post_signal={round(post_signal, 2)}, post_density={round(post_density, 3)}"
             community_scores.append((score, community, why))
             if cid is not None:
                 context["community_scores"][cid] = round(score, 3)
                 context["why_community"][cid] = why
 
         community_scores.sort(key=lambda item: item[0], reverse=True)
-        context["communities"] = [item[1] for item in community_scores[:20]]
+        context["communities"] = [item[1] for item in community_scores[: self.MAX_COMMUNITIES]]
         context["ranking_factors"].append(
             {
                 "factor": "balanced_ranking",
-                "post_weights": {"voteScore": 1.5, "commentCount": 2.0, "viewCount": 0.01},
-                "community_weights": {"memberCount": 0.00066, "postSignal": 1.0},
+                "post_weights": {
+                    "voteScore": 1.5,
+                    "commentCount": 2.0,
+                    "viewCount": 0.01,
+                    "matched_comment_bonus": 15.0,
+                },
+                "community_weights": {"memberCount": 0.00066, "postSignal": 1.0, "post_density": 2.0},
                 "freshness_days": freshness_days,
             }
         )
@@ -1259,12 +1689,13 @@ class CommunitySearchAgent:
             author = str(post.get("authorName", "")).strip()
             if author:
                 users.add(author)
-        for comment_list in comments_by_post.values():
-            for comment in self._flatten_comments(comment_list, post_id=0):
+        for key, comment_list in comments_by_post.items():
+            post_id = self._to_int(key) or 0
+            for comment in self._flatten_comments(comment_list, post_id=post_id):
                 author = str(comment.get("authorName", "")).strip()
                 if author:
                     users.add(author)
-        return sorted(users)[:40]
+        return sorted(users)[: self.MAX_POSTS]
 
     def _infer_result_type(self, lowered_query: str) -> str:
         if any(word in lowered_query for word in ["flairs", "tags", "labels"]):
@@ -1303,6 +1734,13 @@ class CommunitySearchAgent:
             return parsed if parsed > 0 else None
         except (TypeError, ValueError):
             return None
+
+    def _coerce_confidence(self, value: Any) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(parsed, 1.0))
 
     def _parse_dt(self, value: Any) -> datetime | None:
         if not value:

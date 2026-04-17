@@ -22,9 +22,6 @@ async def lifespan(app: FastAPI):
         backend=backend,
         groq_api_key=settings.groq_api_key,
         groq_model=settings.groq_model,
-        ollama_base_url=settings.ollama_base_url,
-        ollama_model=settings.ollama_model,
-        llm_provider=settings.llm_provider,
         max_actions=settings.max_agent_actions,
     )
     app.state.backend = backend
@@ -58,6 +55,7 @@ async def agent_search(payload: AgentSearchRequest) -> AgentSearchResponse:
     if not payload.query.strip():
         raise HTTPException(status_code=400, detail="Query is required")
 
+    import traceback
     try:
         result = await app.state.agent.run(
             query=payload.query,
@@ -67,6 +65,9 @@ async def agent_search(payload: AgentSearchRequest) -> AgentSearchResponse:
             community_id=payload.community_id,
         )
     except Exception as ex:
+        print("\n--- AGENT EXECUTION ERROR ---")
+        traceback.print_exc()
+        print("--- END ERROR ---\n")
         raise HTTPException(status_code=502, detail=f"Agent execution failed: {ex}") from ex
 
     if not payload.include_trace:

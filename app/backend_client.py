@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -10,6 +12,15 @@ class BackendClient:
         self.base_url = base_url.rstrip("/")
         self.community_prefix = community_prefix.rstrip("/")
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds))
+        self._cache: dict[str, dict[Any, Any]] = {}
+        self.reset_cache()
+
+    def reset_cache(self) -> None:
+        self._cache = {
+            "list_communities": {},
+            "list_flairs": {},
+            "get_post_comments": {},
+        }
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -48,25 +59,42 @@ class BackendClient:
         return response.json()
 
     async def list_communities(self, user_id: int | None = None) -> list[dict[str, Any]]:
+        cache_key = user_id
+        if cache_key in self._cache["list_communities"]:
+            return list(self._cache["list_communities"][cache_key])
+
         response = await self.client.get(
             f"{self.base_url}{self.community_prefix}/communities",
             headers=self._headers(user_id=user_id),
         )
         response.raise_for_status()
-        return response.json()
+        payload = response.json()
+        self._cache["list_communities"][cache_key] = list(payload)
+        return list(payload)
 
     async def list_flairs(self, community_id: int) -> list[dict[str, Any]]:
+        if community_id in self._cache["list_flairs"]:
+            return list(self._cache["list_flairs"][community_id])
+
         response = await self.client.get(f"{self.base_url}{self.community_prefix}/communities/{community_id}/flairs")
         response.raise_for_status()
-        return response.json()
+        payload = response.json()
+        self._cache["list_flairs"][community_id] = list(payload)
+        return list(payload)
 
     async def get_post_comments(self, post_id: int, user_id: int | None = None) -> list[dict[str, Any]]:
+        cache_key = (post_id, user_id)
+        if cache_key in self._cache["get_post_comments"]:
+            return list(self._cache["get_post_comments"][cache_key])
+
         response = await self.client.get(
             f"{self.base_url}{self.community_prefix}/posts/{post_id}/comments",
             headers=self._headers(user_id=user_id),
         )
         response.raise_for_status()
-        return response.json()
+        payload = response.json()
+        self._cache["get_post_comments"][cache_key] = list(payload)
+        return list(payload)
 
     async def get_post_by_id(self, post_id: int, user_id: int | None = None) -> dict[str, Any] | None:
         try:
@@ -89,38 +117,30 @@ class BackendClient:
                 continue
         return None
 
-    async def get_user_posts(self, username: str, user_id: int | None = None, limit: int = 25, day: int | None = None, month: int | None = None, year: int | None = None) -> list[dict[str, Any]]:
+    async def get_user_posts(
+        self,
+        username: str,
+        user_id: int | None = None,
+        limit: int = 25,
+        day: int | None = None,
+        month: int | None = None,
+        year: int | None = None,
+    ) -> list[dict[str, Any]]:
         query = (username or "").strip()
         if not query:
             return []
+
         posts = await self.search_posts(query, user_id=user_id, limit=max(10, min(limit, 60)))
         lowered = query.lower()
-        filtered = [p for p in posts if lowered in str(p.get("authorName", "")).strip().lower()]
-        # Date filter if day/month/year provided
-        if day and month and year:
-            from datetime import datetime
-            def in_day_month_year(post):
-                dt = post.get("createdAt")
-                if not dt:
-                    return False
-                try:
-                    d = datetime.fromisoformat(dt.replace("Z", "+00:00"))
-                    return d.day == day and d.month == month and d.year == year
-                except Exception:
-                    return False
-            filtered = [p for p in filtered if in_day_month_year(p)]
-        elif month and year:
-            from datetime import datetime
-            def in_month_year(post):
-                dt = post.get("createdAt")
-                if not dt:
-                    return False
-                try:
-                    d = datetime.fromisoformat(dt.replace("Z", "+00:00"))
-                    return d.month == month and d.year == year
-                except Exception:
-                    return False
-            filtered = [p for p in filtered if in_month_year(p)]
+        filtered = [post for post in posts if lowered in str(post.get("authorName", "")).strip().lower()]
+
+        if day is not None and month is not None and year is not None:
+            filtered = [post for post in filtered if self._matches_date(post.get("createdAt"), day=day, month=month, year=year)]
+        elif month is not None and year is not None:
+            filtered = [post for post in filtered if self._matches_date(post.get("createdAt"), month=month, year=year)]
+        elif year is not None:
+            filtered = [post for post in filtered if self._matches_date(post.get("createdAt"), year=year)]
+
         return filtered[: max(1, min(limit, 60))]
 
     async def get_community_posts(
@@ -148,20 +168,22 @@ class BackendClient:
         return response.json()
 
     async def search_flairs_by_name(self, query: str, communities: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Search for flairs across communities by name."""
-        results = []
+        results: list[dict[str, Any]] = []
         query_lower = query.lower()
-        
-        for community in communities[:10]:  # Limit to first 10 communities to avoid too many requests
-            try:
-                community_id = community.get("id")
-                if not community_id:
-                    continue
-                flairs = await self.list_flairs(community_id)
-                for flair in flairs:
-                    flair_name = str(flair.get("name", "")).lower()
-                    if query_lower in flair_name:
-                        results.append({
+        semaphore = asyncio.Semaphore(4)
+
+        async def load_flairs(community: dict[str, Any]) -> list[dict[str, Any]]:
+            community_id = community.get("id")
+            if not community_id:
+                return []
+            async with semaphore:
+                flairs = await self.list_flairs(int(community_id))
+            matches: list[dict[str, Any]] = []
+            for flair in flairs:
+                flair_name = str(flair.get("name", "")).lower()
+                if query_lower in flair_name:
+                    matches.append(
+                        {
                             "type": "flair",
                             "id": flair.get("id"),
                             "name": flair.get("name"),
@@ -169,28 +191,35 @@ class BackendClient:
                             "community_name": community.get("name"),
                             "color": flair.get("color"),
                             "textColor": flair.get("textColor"),
-                        })
-            except Exception:
+                        }
+                    )
+            return matches
+
+        tasks = [load_flairs(community) for community in communities[:10]]
+        for outcome in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(outcome, Exception):
                 continue
-        
+            results.extend(outcome)
         return results
 
     async def search_rules_by_content(self, query: str, communities: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Search for community rules by content."""
-        results = []
+        results: list[dict[str, Any]] = []
         query_lower = query.lower()
-        
-        for community in communities[:10]:  # Limit to first 10 communities
-            try:
-                community_id = community.get("id")
-                if not community_id:
-                    continue
-                rules = await self.get_community_rules(community_id)
-                for rule in rules:
-                    rule_title = str(rule.get("title", "")).lower()
-                    rule_description = str(rule.get("description", "")).lower()
-                    if query_lower in rule_title or query_lower in rule_description:
-                        results.append({
+        semaphore = asyncio.Semaphore(4)
+
+        async def load_rules(community: dict[str, Any]) -> list[dict[str, Any]]:
+            community_id = community.get("id")
+            if not community_id:
+                return []
+            async with semaphore:
+                rules = await self.get_community_rules(int(community_id))
+            matches: list[dict[str, Any]] = []
+            for rule in rules:
+                rule_title = str(rule.get("title", "")).lower()
+                rule_description = str(rule.get("description", "")).lower()
+                if query_lower in rule_title or query_lower in rule_description:
+                    matches.append(
+                        {
                             "type": "rule",
                             "id": rule.get("id"),
                             "title": rule.get("title"),
@@ -198,8 +227,40 @@ class BackendClient:
                             "community_id": community_id,
                             "community_name": community.get("name"),
                             "order": rule.get("order"),
-                        })
-            except Exception:
+                        }
+                    )
+            return matches
+
+        tasks = [load_rules(community) for community in communities[:10]]
+        for outcome in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(outcome, Exception):
                 continue
-        
+            results.extend(outcome)
         return results
+
+    def _matches_date(
+        self,
+        value: Any,
+        *,
+        day: int | None = None,
+        month: int | None = None,
+        year: int | None = None,
+    ) -> bool:
+        parsed = self._parse_dt(value)
+        if parsed is None:
+            return False
+        if year is not None and parsed.year != year:
+            return False
+        if month is not None and parsed.month != month:
+            return False
+        if day is not None and parsed.day != day:
+            return False
+        return True
+
+    def _parse_dt(self, value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UTC)
+        except ValueError:
+            return None
