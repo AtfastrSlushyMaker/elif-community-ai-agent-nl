@@ -775,17 +775,21 @@ class CommunitySearchAgent:
         retryable_statuses = {429, 503}
 
         async def try_key(api_key, key_idx):
+            import traceback
             async with httpx.AsyncClient(timeout=httpx.Timeout(25)) as client:
                 for attempt in range(3):
                     try:
+                        print(f"[Groq] Trying key {key_idx+1}/{len(key_list)} (attempt {attempt+1})")
                         if trace is not None:
                             trace.append({"step": "groq_try_key", "caller": caller, "api_key": key_idx, "attempt": attempt + 1})
                         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
                         response = await client.post(self.groq_url, headers=headers, json=payload)
                         response.raise_for_status()
                         data = response.json()
+                        print(f"[Groq] Key {key_idx+1} succeeded.")
                         return str(data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
                     except httpx.TimeoutException as ex:
+                        print(f"[Groq] Timeout for key {key_idx+1} on attempt {attempt+1}: {ex}")
                         if attempt < 2:
                             if trace is not None:
                                 trace.append({"step": "groq_retry", "caller": caller, "api_key": key_idx, "attempt": attempt + 1, "error_type": type(ex).__name__})
@@ -794,6 +798,7 @@ class CommunitySearchAgent:
                         break
                     except httpx.HTTPStatusError as ex:
                         status = ex.response.status_code
+                        print(f"[Groq] HTTP error for key {key_idx+1} on attempt {attempt+1}: {status} - {ex}")
                         if status == 429:
                             if trace is not None:
                                 trace.append({"step": "groq_rate_limited", "caller": caller, "api_key": key_idx, "attempt": attempt + 1, "error_type": f"http_{status}"})
@@ -807,9 +812,11 @@ class CommunitySearchAgent:
                             trace.append({"step": "groq_http_error_next_key", "caller": caller, "api_key": key_idx, "status": status})
                         break
                     except Exception as ex:
+                        print(f"[Groq] Exception for key {key_idx+1} on attempt {attempt+1}: {ex}\n{traceback.format_exc()}")
                         if trace is not None:
                             trace.append({"step": "groq_exception_next_key", "caller": caller, "api_key": key_idx, "error": str(ex)})
                         break
+            print(f"[Groq] Key {key_idx+1} failed all attempts.")
             return None
 
         tasks = [asyncio.create_task(try_key(api_key, idx)) for idx, api_key in enumerate(key_list)]
