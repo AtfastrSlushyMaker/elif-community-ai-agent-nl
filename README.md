@@ -35,6 +35,7 @@ async def lifespan(app: FastAPI):
     agent = CommunitySearchAgent(
         backend=backend,
         groq_api_key=settings.groq_api_key,
+        groq_api_keys=settings.groq_api_keys,
         groq_model=settings.groq_model,
         max_actions=settings.max_agent_actions,
     )
@@ -61,6 +62,7 @@ async def agent_search(payload: AgentSearchRequest) -> AgentSearchResponse:
         user_id=payload.user_id,
         act_as_user_id=payload.act_as_user_id,
         max_actions=payload.max_actions,
+        community_id=payload.community_id,
     )
 
     if not payload.include_trace:
@@ -190,7 +192,7 @@ curl -X POST http://127.0.0.1:8095/v1/community/agent-search \
   "model": "llama-3.3-70b-versatile",
   "trace": [
     {"step": "seed_fetch", "posts": 12, "communities": 18},
-    {"step": "plan", "actions": [...]},
+    {"step": "plan", "actions": ["..."]},
     {"step": "action", "result": {"ok": true}}
   ]
 }
@@ -244,24 +246,29 @@ Use one of the dedicated templates:
 - Local runtime: `cp .env.local.example .env`
 - Docker runtime: `cp .env.docker.example .env`
 
-- `GROQ_API_KEY` (required for this Groq-based instance)
-- `GROQ_MODEL` (default: `llama-3.3-70b-versatile`)
-- `BACKEND_BASE_URL` (`http://localhost:8087/elif` for local, `http://host.docker.internal:8087/elif` for Docker)
-- `BACKEND_COMMUNITY_PREFIX` (default: `/api/community`)
-- `HTTP_TIMEOUT_SECONDS` (default: `15`)
-- `MAX_AGENT_ACTIONS` (default: `6`)
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `GROQ_API_KEYS` | Recommended | `""` | Comma-separated list of Groq API keys. The agent tries each key in order; if one is rate-limited (429) it rotates to the next. |
+| `GROQ_API_KEY` | Yes (if `GROQ_API_KEYS` is empty) | `""` | Single Groq API key used as fallback when `GROQ_API_KEYS` is not set. |
+| `GROQ_MODEL` | No | `llama-3.3-70b-versatile` | Groq model identifier. |
+| `LLM_PROVIDER` | No | `groq` | LLM provider name (reserved for future multi-provider support). |
+| `BACKEND_BASE_URL` | Yes | `http://localhost:8087/elif` | Base URL of the Elif backend. Use `http://host.docker.internal:8087/elif` when running in Docker. |
+| `BACKEND_COMMUNITY_PREFIX` | No | `/api/community` | API prefix for community endpoints. |
+| `HTTP_TIMEOUT_SECONDS` | No | `30` | HTTP timeout for backend and Groq API calls. |
+| `MAX_AGENT_ACTIONS` | No | `6` | Maximum number of agent actions per query. |
 
-To use another provider, replace the LLM client implementation in the agent while keeping the same planner/synthesis JSON contracts.
+To use another LLM provider, replace the LLM client implementation in the agent while keeping the same planner/synthesis JSON contracts.
 
 ## Run locally
 
 ```bash
 cd community-ai-agent-nl
 cp .env.local.example .env
+# Edit .env and add your Groq API key(s)
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-./.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8095 --reload
+uvicorn app.main:app --host 0.0.0.0 --port 8095 --reload
 ```
 
 Open `http://127.0.0.1:8095/health` to verify the service is running.
@@ -282,18 +289,89 @@ python3 -m venv .venv
 
 ## Docker
 
+### Build the image
+
 ```bash
 cd community-ai-agent-nl
-cp .env.docker.example .env
 docker build -t community-ai-agent .
+```
+
+### Run the container
+
+Set up your environment file first:
+
+```bash
+cp .env.docker.example .env
+# Edit .env and add your Groq API key(s)
+```
+
+The run command differs slightly by operating system because of how Docker containers reach the host network.
+
+#### macOS (Docker Desktop)
+
+`host.docker.internal` is built into Docker Desktop — no extra flags needed:
+
+```bash
 docker run --env-file .env -p 8095:8095 community-ai-agent
 ```
 
-On Linux Docker hosts, add host gateway mapping:
+#### Windows (Docker Desktop)
+
+Same as macOS — `host.docker.internal` is built into Docker Desktop:
+
+```powershell
+docker run --env-file .env -p 8095:8095 community-ai-agent
+```
+
+#### Linux
+
+On Linux, `host.docker.internal` does not exist by default. You must map it manually with `--add-host`:
 
 ```bash
 docker run --add-host host.docker.internal:host-gateway --env-file .env -p 8095:8095 community-ai-agent
 ```
+
+> **Note:** On Linux with Docker Engine (not Docker Desktop), if `host-gateway` is not supported on your Docker version (< 20.10), replace it with the host's actual IP address (e.g. `172.17.0.1` for the default Docker bridge).
+
+### Verify
+
+Once the container is running, check the health endpoint:
+
+```bash
+curl http://localhost:8095/health
+# Expected: {"status":"ok"}
+```
+
+### Run with Docker Compose (optional)
+
+If you prefer docker compose, create a `docker-compose.yml`:
+
+```yaml
+services:
+  community-ai-agent:
+    build: .
+    env_file: .env
+    ports:
+      - "8095:8095"
+    # Linux only — uncomment the next two lines:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+```
+
+Then run:
+
+```bash
+docker compose up --build
+```
+
+### Platform differences summary
+
+| Feature | macOS | Windows | Linux |
+|---|---|---|---|
+| Docker Desktop | Yes | Yes | Optional |
+| `host.docker.internal` built-in | ✅ | ✅ | ❌ |
+| Extra flag needed | None | None | `--add-host host.docker.internal:host-gateway` |
+| Docker Engine version | Any | Any | ≥ 20.10 for `host-gateway` |
 
 ## Backend contract check (agent actions)
 
@@ -318,3 +396,4 @@ The backend endpoints required by agent-executed API calls are available in Elif
 
 - This service never hardcodes secrets. Keep API keys in `.env` or your secret manager.
 - It is designed as an external service so you can deploy/version it independently from Elif.
+- When using multiple `GROQ_API_KEYS`, the agent tries them sequentially on rate-limit errors (429) for automatic failover.

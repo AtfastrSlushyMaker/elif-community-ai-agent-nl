@@ -84,9 +84,11 @@ class CommunitySearchAgent:
         groq_api_key: str,
         groq_model: str,
         max_actions: int,
+        groq_api_keys: str = "",
     ) -> None:
         self.backend = backend
         self.groq_api_key = groq_api_key
+        self.groq_api_keys = groq_api_keys
         self.groq_model = groq_model
         self.max_actions = max_actions
         self.groq_url = "https://api.groq.com/openai/v1/chat/completions"
@@ -759,11 +761,11 @@ class CommunitySearchAgent:
             if prompt_chars > 12000:
                 trace.append({"step": "prompt_size_warning", "caller": caller, "chars": prompt_chars})
 
-        api_keys = os.getenv("GROQ_API_KEYS")
+        api_keys = self.groq_api_keys
         if api_keys:
             key_list = [k.strip() for k in api_keys.split(",") if k.strip()]
         else:
-            key_list = [os.getenv("GROQ_API_KEY", getattr(self, "groq_api_key", ""))]
+            key_list = [self.groq_api_key]
 
         payload = {
             "model": self.groq_model,
@@ -802,6 +804,8 @@ class CommunitySearchAgent:
                         if status == 429:
                             if trace is not None:
                                 trace.append({"step": "groq_rate_limited", "caller": caller, "api_key": key_idx, "attempt": attempt + 1, "error_type": f"http_{status}"})
+                            print(f"[Groq] Key {key_idx+1} rate-limited, rotating to next key...")
+                            await asyncio.sleep(1)
                             break
                         if status in retryable_statuses and attempt < 2:
                             if trace is not None:
@@ -819,12 +823,8 @@ class CommunitySearchAgent:
             print(f"[Groq] Key {key_idx+1} failed all attempts.")
             return None
 
-        tasks = [asyncio.create_task(try_key(api_key, idx)) for idx, api_key in enumerate(key_list)]
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        for task in done:
-            result = task.result()
+        for idx, api_key in enumerate(key_list):
+            result = await try_key(api_key, idx)
             if result:
                 return result
         if trace is not None:

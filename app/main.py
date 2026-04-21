@@ -21,6 +21,7 @@ async def lifespan(app: FastAPI):
     agent = CommunitySearchAgent(
         backend=backend,
         groq_api_key=settings.groq_api_key,
+        groq_api_keys=settings.groq_api_keys,
         groq_model=settings.groq_model,
         max_actions=settings.max_agent_actions,
     )
