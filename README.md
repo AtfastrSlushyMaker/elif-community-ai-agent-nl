@@ -9,6 +9,21 @@ This is a standalone Python microservice that runs natural-language community se
 
 In this instance, the implementation uses Groq, but the agent pattern is provider-agnostic and can be adapted to your preferred LLM backend.
 
+## How it connects to Elif
+
+In the Elif frontend, the community search experience calls this service from the community post service using:
+
+- `communityAgentApiUrl=http://localhost:8095`
+- `POST /v1/community/agent-search`
+
+The companion service then calls Elif backend community APIs at:
+
+- `BACKEND_BASE_URL=http://localhost:8087/elif`
+- `BACKEND_COMMUNITY_PREFIX=/api/community`
+
+When provided, `user_id` is forwarded to Elif backend requests as `X-User-Id`.
+When provided, `act_as_user_id` is forwarded as `X-Act-As-User-Id`, which allows admin-style impersonation-aware backend flows where supported.
+
 ## How the agent works
 
 The service follows a plan-and-execute loop with guardrails:
@@ -224,7 +239,7 @@ Request fields for `POST /v1/community/agent-search`:
 
 - `query` (required)
 - `user_id` (optional)
-- `act_as_user_id` (optional)
+- `act_as_user_id` (optional, forwarded to the Elif backend as `X-Act-As-User-Id`)
 - `include_trace` (optional, default `false`)
 - `max_actions` (optional, `1..12`)
 - `community_id` (optional, restricts search to one community)
@@ -397,3 +412,4 @@ The backend endpoints required by agent-executed API calls are available in Elif
 - This service never hardcodes secrets. Keep API keys in `.env` or your secret manager.
 - It is designed as an external service so you can deploy/version it independently from Elif.
 - When using multiple `GROQ_API_KEYS`, the agent tries them sequentially on rate-limit errors (429) for automatic failover.
+- The agent can return richer evidence than Elif’s current minimal UI mapping uses today, including comments, rules, flairs, confidence, gaps, ranking factors, and next-best actions.
